@@ -258,17 +258,21 @@ export function useFileSender() {
   }, []);
 
   const transferToReceiver = useCallback(async (receiverId, conn, filesToSend, tier) => {
-    // Dynamic config — auto-scales chunk size based on LIVE receiver speed
+    // Dynamic config — starts LARGE, scales DOWN only if network is too slow.
+    // This prevents the Speed Trap where small chunks → low speed → chunks never grow.
+    // Safe because all payloads are sliced to 64KB at the SCTP transport layer anyway.
     const getConfig = () => {
       const spd = latestReceiverSpeed;
-      // Aggressively scale chunks based on actual throughput.
-      // Start with calibration tier, upgrade/downgrade dynamically.
-      if (spd > 8 * 1024 * 1024)  return CHUNK_TIERS.ultra;      // > 8 MB/s  → 10MB chunks
-      if (spd > 3 * 1024 * 1024)  return CHUNK_TIERS.lan;        // > 3 MB/s  → 2MB chunks
-      if (spd > 1 * 1024 * 1024)  return CHUNK_TIERS.fast;       // > 1 MB/s  → 1MB chunks
-      if (spd > 500 * 1024)       return CHUNK_TIERS.balanced;   // > 500 KB/s → 512KB chunks
-      if (spd > 0)                return CHUNK_TIERS.unstable;   // < 500 KB/s → 256KB chunks
-      return CHUNK_TIERS[tier] || CHUNK_TIERS.balanced;           // Fallback to calibration
+      // If no speed data yet (transfer just started), start with 2MB chunks aggressively.
+      // Backpressure will naturally throttle if the network can't handle it.
+      if (spd <= 0) return CHUNK_TIERS.lan;  // 2MB chunks, safe starting point
+      
+      // Scale dynamically based on LIVE measured speed
+      if (spd > 8 * 1024 * 1024)  return CHUNK_TIERS.ultra;     // > 8 MB/s  → 10MB chunks
+      if (spd > 3 * 1024 * 1024)  return CHUNK_TIERS.lan;       // > 3 MB/s  → 2MB chunks
+      if (spd > 1 * 1024 * 1024)  return CHUNK_TIERS.fast;      // > 1 MB/s  → 1MB chunks
+      if (spd > 500 * 1024)       return CHUNK_TIERS.balanced;  // > 500 KB/s → 512KB chunks
+      return CHUNK_TIERS.unstable;                               // < 500 KB/s → 256KB chunks
     };
 
     updateReceiver(receiverId, { status: 'transferring', progress: 0, speed: 0, eta: '' });
