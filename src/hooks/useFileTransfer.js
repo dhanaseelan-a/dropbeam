@@ -139,44 +139,37 @@ async function detectNetwork(conn) {
 
     r.localIP = la; r.remoteIP = ra;
 
-    // SCENARIO 1: Is a Relay (TURN server) physically being used to route traffic?
-    if (lt === 'relay' || rt === 'relay') {
-      r.mode = 'relay';
-    } 
-    // SCENARIO 2: Is it physically a Host-to-Host direct internal connection?
-    else if (lt === 'host' && rt === 'host') {
-      r.mode = 'lan';
-    } 
-    // SCENARIO 3: Are they on the EXACT same public IP? 
-    // If they share a public IP but the connection is Server Reflexive, they are on the SAME WiFi router behind a NAT.
-    else if ((lt === 'srflx' || rt === 'srflx') && la && ra && la === ra) {
-      r.mode = 'wifi';
-    }
-    // SCENARIO 4: The Hotspot Edge Case vs The Mobile Data Edge Case
-    // Host candidates mean the browser found a local network interface. 
-    // Server Reflexive (srflx) means the browser had to ask a STUN server for its IP because it's behind a NAT (Mobile Data).
+    // Default WebRTC classification logic
+    if (lt === 'relay' || rt === 'relay') r.mode = 'relay';
+    else if (lt === 'host' && rt === 'host') r.mode = 'lan';
+    else if ((lt === 'srflx' || rt === 'srflx') && la && ra && la === ra) r.mode = 'wifi';
+    else if (lt === 'host' || rt === 'host') r.mode = 'wifi';
     else {
-      // If WebRTC successfully established a connection where AT LEAST ONE side is using a 'host' candidate,
-      // it means one device is physically broadcasting a local network (a Mobile Hotspot) that the other joined.
-      // E.g., Laptop (srflx) -> Hotspot Phone (host)
       let hasWorkingHostPair = false;
       stats.forEach((s) => {
         if (s.type === 'candidate-pair' && s.state === 'succeeded') {
           const lc = stats.get(s.localCandidateId);
           const rc = stats.get(s.remoteCandidateId);
-          if (lc && rc && (lc.candidateType === 'host' || rc.candidateType === 'host')) {
-            hasWorkingHostPair = true;
-          }
+          if (lc && rc && (lc.candidateType === 'host' || rc.candidateType === 'host')) hasWorkingHostPair = true;
         }
       });
+      r.mode = hasWorkingHostPair ? 'wifi' : 'internet';
+    }
 
-      if (hasWorkingHostPair) {
-        // One side is acting as a host router. We give it 'wifi' tier because Hotspots are slower than true LANs
-        r.mode = 'wifi';
-      } else {
-        // Both sides are 'srflx' with different public IPs. This is pure Mobile Data (Jio/Vi/Internet).
-        r.mode = 'internet'; 
-      }
+    // OVERRIDE: Indian Telecom Carrier-Grade NAT (Jio / Vi / Airtel) Edge Case
+    // Two phones on mobile data will often get 10.x.x.x IPs. WebRTC successfully connects them directly
+    // and falsely reports 'lan' because they are technically on the same telco intranet. We must force this to 'internet'.
+    const isCGNAT = (ip) => ip.startsWith('10.') && !ip.startsWith('10.43.') && !ip.startsWith('10.0.');
+    if (isCGNAT(la) && isCGNAT(ra) && r.mode !== 'relay') {
+      r.mode = 'internet'; 
+    }
+    
+    // OVERRIDE: Android Hotspot to Android Mobile Edge Case
+    // Often connects via Server Reflexive instead of Host. We aggressively look for local IP subnets to upgrade them to 'wifi'.
+    const isLocalIP = (ip) => ip.startsWith('192.168.') || ip.startsWith('172.') || ip.startsWith('10.43.');
+    if (isLocalIP(la) && isLocalIP(ra) && r.mode === 'internet') {
+      const lp = la.split('.'), rp = ra.split('.');
+      if (lp[0] === rp[0] && lp[1] === rp[1]) r.mode = 'wifi';
     }
 
     const m = NETWORK_MODES[r.mode];
@@ -300,23 +293,24 @@ export function useFileSender() {
     const getConfig = () => {
       const limit = speedLimitRef.current;
       
-      // Auto-scaling logic (Base tier on LIVE SPEED, ignore calibration tier if we are actually moving data faster)
-      // Speed scales Up to 10MB chunks if we are maintaining 30MB/s throughput
+      // Auto-scaling logic (Aggressively ramp up chunks sizes based on LIVE SPEED)
       let autoTier = tier;
       const spd = latestReceiverSpeed;
-      if (spd > 30 * 1024 * 1024) autoTier = 'ultra';
-      else if (spd > 15 * 1024 * 1024) autoTier = 'lan';
-      else if (spd > 5 * 1024 * 1024) autoTier = 'fast';
-      else if (spd > 1 * 1024 * 1024) autoTier = 'balanced';
-      else if (spd > 0) autoTier = 'unstable';
+      if (spd > 8 * 1024 * 1024) autoTier = 'ultra';       // > 8 MB/s = 10MB Chunks
+      else if (spd > 3 * 1024 * 1024) autoTier = 'lan';    // > 3 MB/s = 2MB Chunks
+      else if (spd > 1 * 1024 * 1024) autoTier = 'fast';   // > 1 MB/s = 1MB Chunks
+      else if (spd > 500 * 1024) autoTier = 'balanced';    // > 500 KB/s = 512KB Chunks
+      else if (spd > 0) autoTier = 'unstable';             // < 500 KB/s = 256KB Chunks
 
       let config = CHUNK_TIERS[autoTier] || CHUNK_TIERS.balanced;
 
-      // Enforce very tight backpressure to match throttle limits (prevent WebRTC buffering 50MB instantly)
+      // Allow massive chunks if explicitly requested by limit, bounded only by 10MB absolute ceiling
       if (limit > 0) {
-        // Limit dictates chunk size safely to prevent memory hoarding on throttled transfers
-        const constrainedSize = Math.max(16 * 1024, Math.min(config.size, Math.floor(limit / 4), 1024 * 1024));
-        return { size: constrainedSize, buffer: constrainedSize * 2, bufLow: constrainedSize, pipeline: 1 };
+        if (limit >= 10 * 1024 * 1024) return { size: 10 * 1024 * 1024, buffer: 20 * 1024 * 1024, bufLow: 5 * 1024 * 1024, pipeline: 1 };
+        if (limit >= 5 * 1024 * 1024) return { size: 4 * 1024 * 1024, buffer: 8 * 1024 * 1024, bufLow: 2 * 1024 * 1024, pipeline: 1 };
+        if (limit >= 2 * 1024 * 1024) return { size: 2 * 1024 * 1024, buffer: 4 * 1024 * 1024, bufLow: 1 * 1024 * 1024, pipeline: 1 };
+        if (limit >= 1 * 1024 * 1024) return { size: 1024 * 1024, buffer: 2 * 1024 * 1024, bufLow: 512 * 1024, pipeline: 1 };
+        return { size: 512 * 1024, buffer: 1024 * 1024, bufLow: 512 * 1024, pipeline: 1 };
       }
       
       return config;
