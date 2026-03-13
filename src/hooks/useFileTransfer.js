@@ -153,33 +153,30 @@ async function detectNetwork(conn) {
       r.mode = 'wifi';
     }
     // SCENARIO 4: The Hotspot Edge Case vs The Mobile Data Edge Case
-    // Sometimes mobile hotspots force connections through srflx. Sometimes two phones on mobile data get similar 10.x.x.x Carrier NAT IPs.
+    // Host candidates mean the browser found a local network interface. 
+    // Server Reflexive (srflx) means the browser had to ask a STUN server for its IP because it's behind a NAT (Mobile Data).
     else {
-      let isSameSubnet = false;
-      // Aggressively check ALL local socket addresses against ALL remote socket addresses for subnet matches
-      for (const hl of hostLocal) {
-        for (const hr of hostRemote) {
-          if (hl && hr) {
-            const lp = hl.split('.'), rp = hr.split('.');
-            // If the first 3 octets match, heavily imply they are on the same localized network (Hotspot / LAN)
-            // EXCEPTION: 10.x.x.x is notoriously used by Mobile Carriers globally for Carrier-Grade NAT. 
-            // Two different phones on Jio/Vi might get 10.114.50.x and falsely trigger a LAN match.
-            // But true Hotspots usually assign 192.168.x.x or 172.x.x.x or 10.43.x.x
-            if (lp.length === 4 && rp.length === 4 && lp[0] === rp[0] && lp[1] === rp[1] && lp[2] === rp[2]) {
-               // Protect against the massive 10.x.x.x Carrier-Grade NAT collisions
-               if (lp[0] === '10' && lp[1] !== '43' && lp[1] !== '0') {
-                  // It's a Carrier-Grade NAT collision (two cell phones on data). NOT a LAN.
-                  isSameSubnet = false;
-               } else {
-                 isSameSubnet = true;
-               }
-            }
+      // If WebRTC successfully established a connection where AT LEAST ONE side is using a 'host' candidate,
+      // it means one device is physically broadcasting a local network (a Mobile Hotspot) that the other joined.
+      // E.g., Laptop (srflx) -> Hotspot Phone (host)
+      let hasWorkingHostPair = false;
+      stats.forEach((s) => {
+        if (s.type === 'candidate-pair' && s.state === 'succeeded') {
+          const lc = stats.get(s.localCandidateId);
+          const rc = stats.get(s.remoteCandidateId);
+          if (lc && rc && (lc.candidateType === 'host' || rc.candidateType === 'host')) {
+            hasWorkingHostPair = true;
           }
         }
-      }
+      });
 
-      if (isSameSubnet) r.mode = 'lan'; // It's a Hotspot misclassified as Internet
-      else r.mode = 'internet';         // It's two cell phones (or actual distant internet devices)
+      if (hasWorkingHostPair) {
+        // One side is acting as a host router. We give it 'wifi' tier because Hotspots are slower than true LANs
+        r.mode = 'wifi';
+      } else {
+        // Both sides are 'srflx' with different public IPs. This is pure Mobile Data (Jio/Vi/Internet).
+        r.mode = 'internet'; 
+      }
     }
 
     const m = NETWORK_MODES[r.mode];
@@ -302,23 +299,26 @@ export function useFileSender() {
     // Dynamic config — re-read each file iteration
     const getConfig = () => {
       const limit = speedLimitRef.current;
-      let config = CHUNK_TIERS[tier] || CHUNK_TIERS.balanced;
+      
+      // Auto-scaling logic (Base tier on LIVE SPEED, ignore calibration tier if we are actually moving data faster)
+      // Speed scales Up to 10MB chunks if we are maintaining 30MB/s throughput
+      let autoTier = tier;
+      const spd = latestReceiverSpeed;
+      if (spd > 30 * 1024 * 1024) autoTier = 'ultra';
+      else if (spd > 15 * 1024 * 1024) autoTier = 'lan';
+      else if (spd > 5 * 1024 * 1024) autoTier = 'fast';
+      else if (spd > 1 * 1024 * 1024) autoTier = 'balanced';
+      else if (spd > 0) autoTier = 'unstable';
+
+      let config = CHUNK_TIERS[autoTier] || CHUNK_TIERS.balanced;
 
       // Enforce very tight backpressure to match throttle limits (prevent WebRTC buffering 50MB instantly)
       if (limit > 0) {
-        // Force chunk size to cover max 0.25s of data, max 1MB for large speed limits
+        // Limit dictates chunk size safely to prevent memory hoarding on throttled transfers
         const constrainedSize = Math.max(16 * 1024, Math.min(config.size, Math.floor(limit / 4), 1024 * 1024));
         return { size: constrainedSize, buffer: constrainedSize * 2, bufLow: constrainedSize, pipeline: 1 };
       }
       
-      // Auto-scaling logic if no hard limit is set
-      const spd = latestReceiverSpeed;
-      if (spd > 30 * 1024 * 1024) config = CHUNK_TIERS.ultra;
-      else if (spd > 15 * 1024 * 1024) config = CHUNK_TIERS.lan;
-      else if (spd > 5 * 1024 * 1024) config = CHUNK_TIERS.fast;
-      else if (spd > 1 * 1024 * 1024) config = CHUNK_TIERS.balanced;
-      else if (spd > 0) config = CHUNK_TIERS.unstable;
-
       return config;
     };
 
