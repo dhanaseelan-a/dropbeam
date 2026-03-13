@@ -3,11 +3,11 @@ import Peer from 'peerjs';
 
 // ===== CHUNK TIERS (Hyper-Optimized for Speed) =====
 const CHUNK_TIERS = {
-  unstable: { size: 256 * 1024, label: 'Unstable',   buffer: 4 * 1024 * 1024,  bufLow: 1 * 1024 * 1024, pipeline: 8 },
-  balanced: { size: 512 * 1024, label: 'Balanced',   buffer: 8 * 1024 * 1024,  bufLow: 2 * 1024 * 1024, pipeline: 8 },
-  fast:     { size: 1024 * 1024, label: 'Fast WiFi', buffer: 16 * 1024 * 1024, bufLow: 4 * 1024 * 1024, pipeline: 8 },
-  lan:      { size: 2 * 1024 * 1024, label: 'LAN',   buffer: 32 * 1024 * 1024, bufLow: 8 * 1024 * 1024, pipeline: 12 },
-  ultra:    { size: 8 * 1024 * 1024, label: 'Ultra', buffer: 64 * 1024 * 1024, bufLow: 16 * 1024 * 1024, pipeline: 4 },
+  unstable: { size: 128 * 1024, label: 'Unstable',   buffer: 1 * 1024 * 1024,  bufLow: 256 * 1024, pipeline: 4 },
+  balanced: { size: 256 * 1024, label: 'Balanced',   buffer: 2 * 1024 * 1024,  bufLow: 512 * 1024, pipeline: 6 },
+  fast:     { size: 512 * 1024, label: 'Fast',      buffer: 8 * 1024 * 1024,  bufLow: 2 * 1024 * 1024, pipeline: 8 },
+  lan:      { size: 2 * 1024 * 1024, label: 'LAN',   buffer: 16 * 1024 * 1024, bufLow: 4 * 1024 * 1024, pipeline: 8 },
+  ultra:    { size: 4 * 1024 * 1024, label: 'Ultra', buffer: 32 * 1024 * 1024, bufLow: 8 * 1024 * 1024, pipeline: 4 },
 };
 
 const NETWORK_MODES = {
@@ -184,7 +184,7 @@ async function detectNetwork(conn) {
 
 // ===== SPEED CALIBRATION =====
 async function calibrate(conn) {
-  const sz = 256 * 1024, rounds = 3;
+  const sz = 128 * 1024, rounds = 3;
   conn.send({ type: 'cal-start', rounds, size: sz });
   await new Promise(r => setTimeout(r, 50));
   const speeds = [];
@@ -204,7 +204,7 @@ async function calibrate(conn) {
   if (!speeds.length) return 'balanced';
   const avg = speeds.reduce((a, b) => a + b, 0) / speeds.length;
   let tier;
-  if (avg > 25 * 1024 * 1024) tier = 'ultra'; // > 25 MB/s
+  if (avg > 30 * 1024 * 1024) tier = 'ultra'; // > 30 MB/s
   else if (avg > 10 * 1024 * 1024) tier = 'lan';
   else if (avg > 2 * 1024 * 1024) tier = 'fast';
   else if (avg > 500 * 1024) tier = 'balanced';
@@ -264,14 +264,14 @@ export function useFileSender() {
     const getConfig = () => {
       const spd = latestReceiverSpeed;
       // No speed data yet? Start moderate. Backpressure handles congestion.
-      if (spd <= 0) return CHUNK_TIERS.balanced;  // 512KB chunks — safe for ANY network
+      if (spd <= 0) return CHUNK_TIERS.balanced;  // 256KB chunks — safe for ANY network
       
       // Scale dynamically based on LIVE measured speed
-      if (spd > 8 * 1024 * 1024)  return CHUNK_TIERS.ultra;     // > 8 MB/s  → 8MB chunks
-      if (spd > 3 * 1024 * 1024)  return CHUNK_TIERS.lan;       // > 3 MB/s  → 2MB chunks
-      if (spd > 1 * 1024 * 1024)  return CHUNK_TIERS.fast;      // > 1 MB/s  → 1MB chunks
-      if (spd > 500 * 1024)       return CHUNK_TIERS.balanced;  // > 500 KB/s → 512KB chunks
-      return CHUNK_TIERS.unstable;                               // < 500 KB/s → 256KB chunks
+      if (spd > 30 * 1024 * 1024) return CHUNK_TIERS.ultra;     // > 30 MB/s  → 4MB chunks
+      if (spd > 10 * 1024 * 1024) return CHUNK_TIERS.lan;       // > 10 MB/s  → 2MB chunks
+      if (spd > 2 * 1024 * 1024)  return CHUNK_TIERS.fast;      // > 2 MB/s  → 512KB chunks
+      if (spd > 500 * 1024)       return CHUNK_TIERS.balanced;  // > 500 KB/s → 256KB chunks
+      return CHUNK_TIERS.unstable;                               // < 500 KB/s → 128KB chunks
     };
 
     updateReceiver(receiverId, { status: 'transferring', progress: 0, speed: 0, eta: '' });
@@ -383,12 +383,12 @@ export function useFileSender() {
             });
           }
 
-          // WebRTC MTU Optimization: Sending massive blocks causes SCTP buffer overflow on WiFi.
-          // We slice the file buffer into zero-copy 128KB chunks. 
-          // 128KB is the absolute sweet spot: avoids SCTP packet reassembly timeouts on weak routers, 
-          // while still keeping encryption/protocol overhead extremely low.
+          // WebRTC MTU Optimization: Sending massive blocks causes SCTP buffer overflow on Mobile Hotspots.
+          // We slice the file buffer into zero-copy 64KB chunks. 
+          // 64KB is universally safe: avoids SCTP packet reassembly timeouts on weak routers and internet transfers, 
+          // while still keeping encryption/protocol overhead completely negligible.
           const u8 = new Uint8Array(buf);
-          const MAX_PAYLOAD = 128 * 1024;
+          const MAX_PAYLOAD = 64 * 1024;
           for (let pByte = 0; pByte < u8.byteLength; pByte += MAX_PAYLOAD) {
             const chunkView = new Uint8Array(u8.buffer, u8.byteOffset + pByte, Math.min(MAX_PAYLOAD, u8.byteLength - pByte));
             conn.send(chunkView);
