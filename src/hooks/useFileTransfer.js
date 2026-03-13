@@ -364,8 +364,8 @@ export function useFileSender() {
         await waitIfPaused(pausedRef, destroyedRef);
         if (destroyedRef.current) break;
 
-        // Re-read config each iteration for live changes
-        const c = getConfig();
+        // Re-read config before pipelining to allow instant slider changes
+        let c = getConfig();
         if (c.size !== lastSentChunkSize) {
           lastSentChunkSize = c.size;
           try { conn.send({ type: 'config-update', chunkSize: c.size }); } catch(e){}
@@ -376,6 +376,19 @@ export function useFileSender() {
         const reads = [];
         let pre = offset;
         for (let i = 0; i < c.pipeline && pre < file.size; i++) {
+          
+          // CRITICAL: Sub-pipeline check. If the user clicks the speed slider WHILE we are
+          // generating the pipeline, we must instantly abort the large buffered reads and switch
+          // to the requested small chunk size so the speed drop is instantaneous.
+          const freshC = getConfig();
+          if (freshC.size !== c.size) {
+            c = freshC;
+            lastSentChunkSize = c.size;
+            try { conn.send({ type: 'config-update', chunkSize: c.size }); } catch(e){}
+            updateReceiver(receiverId, { activeChunkSize: c.size });
+            break; // Abort this pipeline aggressively to apply new size on next tick
+          }
+
           const end = Math.min(pre + c.size, file.size);
           reads.push(file.slice(pre, end).arrayBuffer());
           pre = end;
