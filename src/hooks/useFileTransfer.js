@@ -258,14 +258,13 @@ export function useFileSender() {
   }, []);
 
   const transferToReceiver = useCallback(async (receiverId, conn, filesToSend, tier) => {
-    // Dynamic config — starts LARGE, scales DOWN only if network is too slow.
-    // This prevents the Speed Trap where small chunks → low speed → chunks never grow.
-    // Safe because all payloads are sliced to 64KB at the SCTP transport layer anyway.
+    // Dynamic config — starts MODERATE, scales UP/DOWN based on live speed.
+    // Starting with 512KB (pipeline=6, buffer=4MB) prevents flooding slow hotspot connections.
+    // Within 1-2 seconds, the auto-scaler ramps to 2MB/10MB on fast networks.
     const getConfig = () => {
       const spd = latestReceiverSpeed;
-      // If no speed data yet (transfer just started), start with 2MB chunks aggressively.
-      // Backpressure will naturally throttle if the network can't handle it.
-      if (spd <= 0) return CHUNK_TIERS.lan;  // 2MB chunks, safe starting point
+      // No speed data yet? Start moderate. Backpressure handles congestion.
+      if (spd <= 0) return CHUNK_TIERS.balanced;  // 512KB chunks — safe for ANY network
       
       // Scale dynamically based on LIVE measured speed
       if (spd > 8 * 1024 * 1024)  return CHUNK_TIERS.ultra;     // > 8 MB/s  → 10MB chunks
