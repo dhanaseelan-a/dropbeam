@@ -1,13 +1,13 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
-// ===== CHUNK TIERS =====
+// ===== CHUNK TIERS (Hyper-Optimized for Speed) =====
 const CHUNK_TIERS = {
-  unstable: { size: 256 * 1024, label: 'Unstable', buffer: 2 * 1024 * 1024, bufLow: 512 * 1024, pipeline: 4 },
-  balanced: { size: 512 * 1024, label: 'Balanced', buffer: 4 * 1024 * 1024, bufLow: 1 * 1024 * 1024, pipeline: 6 },
-  fast:     { size: 1024 * 1024, label: 'Fast WiFi', buffer: 8 * 1024 * 1024, bufLow: 2 * 1024 * 1024, pipeline: 8 },
-  lan:      { size: 2 * 1024 * 1024, label: 'LAN', buffer: 16 * 1024 * 1024, bufLow: 4 * 1024 * 1024, pipeline: 12 },
-  ultra:    { size: 10 * 1024 * 1024, label: 'Ultra (10MB)', buffer: 40 * 1024 * 1024, bufLow: 10 * 1024 * 1024, pipeline: 4 },
+  unstable: { size: 256 * 1024, label: 'Unstable',   buffer: 4 * 1024 * 1024,  bufLow: 1 * 1024 * 1024, pipeline: 8 },
+  balanced: { size: 512 * 1024, label: 'Balanced',   buffer: 8 * 1024 * 1024,  bufLow: 2 * 1024 * 1024, pipeline: 8 },
+  fast:     { size: 1024 * 1024, label: 'Fast WiFi', buffer: 16 * 1024 * 1024, bufLow: 4 * 1024 * 1024, pipeline: 8 },
+  lan:      { size: 2 * 1024 * 1024, label: 'LAN',   buffer: 32 * 1024 * 1024, bufLow: 8 * 1024 * 1024, pipeline: 12 },
+  ultra:    { size: 8 * 1024 * 1024, label: 'Ultra', buffer: 64 * 1024 * 1024, bufLow: 16 * 1024 * 1024, pipeline: 4 },
 };
 
 const NETWORK_MODES = {
@@ -267,7 +267,7 @@ export function useFileSender() {
       if (spd <= 0) return CHUNK_TIERS.balanced;  // 512KB chunks — safe for ANY network
       
       // Scale dynamically based on LIVE measured speed
-      if (spd > 8 * 1024 * 1024)  return CHUNK_TIERS.ultra;     // > 8 MB/s  → 10MB chunks
+      if (spd > 8 * 1024 * 1024)  return CHUNK_TIERS.ultra;     // > 8 MB/s  → 8MB chunks
       if (spd > 3 * 1024 * 1024)  return CHUNK_TIERS.lan;       // > 3 MB/s  → 2MB chunks
       if (spd > 1 * 1024 * 1024)  return CHUNK_TIERS.fast;      // > 1 MB/s  → 1MB chunks
       if (spd > 500 * 1024)       return CHUNK_TIERS.balanced;  // > 500 KB/s → 512KB chunks
@@ -384,11 +384,11 @@ export function useFileSender() {
           }
 
           // WebRTC MTU Optimization: Sending massive blocks causes SCTP buffer overflow on WiFi.
-          // We slice the file buffer into zero-copy 256KB chunks. 
-          // 256KB is the sweet spot: small enough to prevent WebRTC stalling, 
-          // but large enough to drastically minimize UDP/DTLS protocol overhead.
+          // We slice the file buffer into zero-copy 128KB chunks. 
+          // 128KB is the absolute sweet spot: avoids SCTP packet reassembly timeouts on weak routers, 
+          // while still keeping encryption/protocol overhead extremely low.
           const u8 = new Uint8Array(buf);
-          const MAX_PAYLOAD = 256 * 1024;
+          const MAX_PAYLOAD = 128 * 1024;
           for (let pByte = 0; pByte < u8.byteLength; pByte += MAX_PAYLOAD) {
             const chunkView = new Uint8Array(u8.buffer, u8.byteOffset + pByte, Math.min(MAX_PAYLOAD, u8.byteLength - pByte));
             conn.send(chunkView);
