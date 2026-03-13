@@ -383,10 +383,12 @@ export function useFileSender() {
             });
           }
 
-          // WebRTC MTU Optimization: Sending > 64KB in a single frame can cause severe SCTP packet loss/stalling on WiFi.
-          // We slice the large memory buffer into zero-copy 64KB chunks for the actual DataChannel transfer.
+          // WebRTC MTU Optimization: Sending massive blocks causes SCTP buffer overflow on WiFi.
+          // We slice the file buffer into zero-copy 256KB chunks. 
+          // 256KB is the sweet spot: small enough to prevent WebRTC stalling, 
+          // but large enough to drastically minimize UDP/DTLS protocol overhead.
           const u8 = new Uint8Array(buf);
-          const MAX_PAYLOAD = 64 * 1024;
+          const MAX_PAYLOAD = 256 * 1024;
           for (let pByte = 0; pByte < u8.byteLength; pByte += MAX_PAYLOAD) {
             const chunkView = new Uint8Array(u8.buffer, u8.byteOffset + pByte, Math.min(MAX_PAYLOAD, u8.byteLength - pByte));
             conn.send(chunkView);
