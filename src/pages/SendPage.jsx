@@ -38,31 +38,26 @@ function SendPage({ onTransferStateChange }) {
     const groups = { root: [] };
     let hasFolders = false;
 
+    // For Android/iOS image selection and standard non-folder files
     for (const f of acceptedFiles) {
-      // Mobile devices sometimes provide fake paths for photos (e.g. /image/123.jpg)
-      // Real dragged folders usually have webkitRelativePath set properly by the browser.
-      const relPath = f.webkitRelativePath || ''; 
+      const pathStr = f.webkitRelativePath || ''; 
+      const parts = pathStr.split('/').filter(Boolean);
 
-      // If there is no relative path, or the relative path is just the filename, it's not in a folder
-      if (!relPath || relPath === f.name) {
-        groups.root.push(f);
+      // A real folder drop creates paths like `folder/file.jpg` 
+      // Individual files just have `file.jpg` or an empty path.
+      if (parts.length > 1) {
+        hasFolders = true;
+        const topFolder = parts[0];
+        if (!groups[topFolder]) groups[topFolder] = [];
+        groups[topFolder].push({ file: f, path: parts.slice(1).join('/') });
       } else {
-        const parts = relPath.replace(/^\//, '').split('/');
-        
-        // If it has multiple parts in the webkitRelativePath, it came from a dropped folder
-        if (parts.length > 1) {
-          hasFolders = true;
-          const topFolder = parts[0];
-          if (!groups[topFolder]) groups[topFolder] = [];
-          groups[topFolder].push({ file: f, path: parts.slice(1).join('/') });
-        } else {
-          groups.root.push(f);
-        }
+        groups.root.push(f);
       }
     }
 
+    // Fast-path: no real folders detected, send as raw standard files
     if (!hasFolders) {
-      setFiles(acceptedFiles);
+      setFiles([...acceptedFiles]);
       initPeer();
       return;
     }
