@@ -139,7 +139,7 @@ function ReceivePage({ onTransferStateChange }) {
           <div style={{ textAlign: 'center' }}>
             <div className="status-badge status-error">{error || 'Connection failed'}</div>
             <p style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginTop: '0.3rem' }}>Make sure sender's tab is open</p>
-            <button className="btn btn-secondary" onClick={handleReset} style={{ marginTop: '1rem' }}>Try again</button>
+            <button className="btn btn-secondary" onClick={() => window.location.reload()} style={{ marginTop: '1rem' }}>Try again</button>
           </div>
         </div>
       )}

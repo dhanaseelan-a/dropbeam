@@ -287,7 +287,7 @@ function SendPage({ onTransferStateChange }) {
           {status === 'error' && (
             <div style={{ textAlign: 'center' }} className="fade-in">
               <div className="status-badge status-error">{error}</div>
-              <button className="btn btn-secondary" onClick={handleReset} style={{ marginTop: '1rem' }}>Try again</button>
+              <button className="btn btn-secondary" onClick={() => window.location.reload()} style={{ marginTop: '1rem' }}>Try again</button>
             </div>
           )}
         </div>

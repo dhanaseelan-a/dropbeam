@@ -122,41 +122,70 @@ async function detectNetwork(conn) {
         lId = s.localCandidateId; rId = s.remoteCandidateId;
       }
     });
-    let lt = '', rt = '', la = '', ra = '';
-    stats.forEach((s) => {
-      if (s.type === 'local-candidate' && s.id === lId) { lt = s.candidateType || ''; la = s.address || s.ip || ''; }
-      if (s.type === 'remote-candidate' && s.id === rId) { rt = s.candidateType || ''; ra = s.address || s.ip || ''; }
-    });
-    r.localIP = la; r.remoteIP = ra;
 
-    // Find if ANY host-to-host pair actually succeeded
-    let hasWorkingHostPair = false;
+    let lt = '', rt = '', la = '', ra = '';
+    const hostLocal = [], hostRemote = [];
+    
     stats.forEach((s) => {
-      if (s.type === 'candidate-pair' && s.state === 'succeeded') {
-        const lc = stats.get(s.localCandidateId);
-        const rc = stats.get(s.remoteCandidateId);
-        if (lc && rc && lc.candidateType === 'host' && rc.candidateType === 'host') {
-          hasWorkingHostPair = true;
-        }
+      if (s.type === 'local-candidate') {
+        if (s.id === lId) { lt = s.candidateType || ''; la = s.address || s.ip || ''; }
+        if (s.candidateType === 'host') hostLocal.push(s.address || s.ip || '');
+      }
+      if (s.type === 'remote-candidate') {
+        if (s.id === rId) { rt = s.candidateType || ''; ra = s.address || s.ip || ''; }
+        if (s.candidateType === 'host') hostRemote.push(s.address || s.ip || '');
       }
     });
 
+    r.localIP = la; r.remoteIP = ra;
+
+    // SCENARIO 1: Is a Relay (TURN server) physically being used to route traffic?
     if (lt === 'relay' || rt === 'relay') {
-      r.mode = 'relay'; // If it's physically using a relay, it IS a relay connection, regardless of local host pairs
-    } else if (lt === 'host' && rt === 'host') {
+      r.mode = 'relay';
+    } 
+    // SCENARIO 2: Is it physically a Host-to-Host direct internal connection?
+    else if (lt === 'host' && rt === 'host') {
       r.mode = 'lan';
-    } else if (hasWorkingHostPair) {
-      r.mode = 'lan'; // Local connection worked but ICE preferred srflx
-    } else if (lt === 'srflx' || rt === 'srflx') {
-      // Both behind same NAT? same public IP = same WiFi
-      if (la && ra && la === ra) r.mode = 'wifi';
-      else r.mode = 'internet';
+    } 
+    // SCENARIO 3: Are they on the EXACT same public IP? 
+    // If they share a public IP but the connection is Server Reflexive, they are on the SAME WiFi router behind a NAT.
+    else if ((lt === 'srflx' || rt === 'srflx') && la && ra && la === ra) {
+      r.mode = 'wifi';
+    }
+    // SCENARIO 4: The Hotspot Edge Case vs The Mobile Data Edge Case
+    // Sometimes mobile hotspots force connections through srflx. Sometimes two phones on mobile data get similar 10.x.x.x Carrier NAT IPs.
+    else {
+      let isSameSubnet = false;
+      // Aggressively check ALL local socket addresses against ALL remote socket addresses for subnet matches
+      for (const hl of hostLocal) {
+        for (const hr of hostRemote) {
+          if (hl && hr) {
+            const lp = hl.split('.'), rp = hr.split('.');
+            // If the first 3 octets match, heavily imply they are on the same localized network (Hotspot / LAN)
+            // EXCEPTION: 10.x.x.x is notoriously used by Mobile Carriers globally for Carrier-Grade NAT. 
+            // Two different phones on Jio/Vi might get 10.114.50.x and falsely trigger a LAN match.
+            // But true Hotspots usually assign 192.168.x.x or 172.x.x.x or 10.43.x.x
+            if (lp.length === 4 && rp.length === 4 && lp[0] === rp[0] && lp[1] === rp[1] && lp[2] === rp[2]) {
+               // Protect against the massive 10.x.x.x Carrier-Grade NAT collisions
+               if (lp[0] === '10' && lp[1] !== '43' && lp[1] !== '0') {
+                  // It's a Carrier-Grade NAT collision (two cell phones on data). NOT a LAN.
+                  isSameSubnet = false;
+               } else {
+                 isSameSubnet = true;
+               }
+            }
+          }
+        }
+      }
+
+      if (isSameSubnet) r.mode = 'lan'; // It's a Hotspot misclassified as Internet
+      else r.mode = 'internet';         // It's two cell phones (or actual distant internet devices)
     }
 
     const m = NETWORK_MODES[r.mode];
     console.log(`%c[DropBeam™] ${m.icon} ${m.label}`, 'color:' + m.color + ';font-weight:bold;font-size:14px');
     console.log(`  Selected pair: ${lt} ${la} | ${rt} ${ra}`);
-    console.log(`  Working host pair found: ${hasWorkingHostPair}`);
+    console.log(`  Hosts: local[${hostLocal.join(',')}] remote[${hostRemote.join(',')}]`);
   } catch (e) { console.log('[DropBeam™] Network detection error:', e); }
   return r;
 }
