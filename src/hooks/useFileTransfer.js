@@ -129,30 +129,24 @@ async function detectNetwork(conn) {
     });
     r.localIP = la; r.remoteIP = ra;
 
-    // Also scan ALL candidates for any host pairs on same subnet
-    const hostLocal = [], hostRemote = [];
+    // Find if ANY host-to-host pair actually succeeded
+    let hasWorkingHostPair = false;
     stats.forEach((s) => {
-      if (s.type === 'local-candidate' && s.candidateType === 'host') hostLocal.push(s.address || s.ip || '');
-      if (s.type === 'remote-candidate' && s.candidateType === 'host') hostRemote.push(s.address || s.ip || '');
-    });
-    let hasLocalMatch = false;
-    for (const hl of hostLocal) {
-      for (const hr of hostRemote) {
-        if (hl && hr) {
-          const lp = hl.split('.'), rp = hr.split('.');
-          if (lp.length === 4 && rp.length === 4 && lp[0] === rp[0] && lp[1] === rp[1] && lp[2] === rp[2]) {
-            hasLocalMatch = true;
-          }
+      if (s.type === 'candidate-pair' && s.state === 'succeeded') {
+        const lc = stats.get(s.localCandidateId);
+        const rc = stats.get(s.remoteCandidateId);
+        if (lc && rc && lc.candidateType === 'host' && rc.candidateType === 'host') {
+          hasWorkingHostPair = true;
         }
       }
-    }
+    });
 
     if (lt === 'relay' || rt === 'relay') {
-      r.mode = hasLocalMatch ? 'wifi' : 'relay'; // relay but same subnet = wifi with relay fallback
+      r.mode = hasWorkingHostPair ? 'wifi' : 'relay';
     } else if (lt === 'host' && rt === 'host') {
       r.mode = 'lan';
-    } else if (hasLocalMatch) {
-      r.mode = 'lan'; // host candidates on same subnet exist even if srflx selected
+    } else if (hasWorkingHostPair) {
+      r.mode = 'lan'; // Local connection worked but ICE preferred srflx
     } else if (lt === 'srflx' || rt === 'srflx') {
       // Both behind same NAT? same public IP = same WiFi
       if (la && ra && la === ra) r.mode = 'wifi';
@@ -162,8 +156,7 @@ async function detectNetwork(conn) {
     const m = NETWORK_MODES[r.mode];
     console.log(`%c[DropBeam™] ${m.icon} ${m.label}`, 'color:' + m.color + ';font-weight:bold;font-size:14px');
     console.log(`  Selected pair: ${lt} ${la} | ${rt} ${ra}`);
-    console.log(`  Host candidates: local=[${hostLocal.join(',')}] remote=[${hostRemote.join(',')}]`);
-    console.log(`  Same subnet match: ${hasLocalMatch}`);
+    console.log(`  Working host pair found: ${hasWorkingHostPair}`);
   } catch (e) { console.log('[DropBeam™] Network detection error:', e); }
   return r;
 }
@@ -212,7 +205,7 @@ async function waitIfPaused(pausedRef, destroyedRef) {
 }
 
 // ===== BANDWIDTH THROTTLE (Token Bucket) =====
-async function throttle(speedLimitRef, windowStartRef, windowBytesRef, bytesSent, destroyedRef) {
+async function throttle(speedLimitRef, windowStartRef, bytesSent, destroyedRef) {
   const limit = speedLimitRef.current;
   if (!limit || limit <= 0) return;
 
@@ -288,6 +281,15 @@ export function useFileSender() {
         const constrainedSize = Math.max(16 * 1024, Math.min(config.size, Math.floor(limit / 4), 256 * 1024));
         return { size: constrainedSize, buffer: constrainedSize * 2, bufLow: constrainedSize, pipeline: 1 };
       }
+      
+      // Auto-scaling logic if no hard limit is set
+      const spd = latestReceiverSpeed;
+      if (spd > 30 * 1024 * 1024) config = CHUNK_TIERS.ultra;
+      else if (spd > 15 * 1024 * 1024) config = CHUNK_TIERS.lan;
+      else if (spd > 5 * 1024 * 1024) config = CHUNK_TIERS.fast;
+      else if (spd > 1 * 1024 * 1024) config = CHUNK_TIERS.balanced;
+      else if (spd > 0) config = CHUNK_TIERS.unstable;
+
       return config;
     };
 
@@ -295,9 +297,11 @@ export function useFileSender() {
 
     // Listen for acks
     let latestReceiverBytes = 0;
+    let latestReceiverSpeed = 0;
     const ackHandler = (data) => {
       if (data?.type === 'ack' && !isBinary(data)) {
         if (data.received !== undefined) latestReceiverBytes = Math.max(latestReceiverBytes, data.received);
+        if (data.speed !== undefined) latestReceiverSpeed = data.speed;
         updateReceiver(receiverId, { progress: data.progress ?? 0, speed: data.speed || 0, eta: data.eta || '' });
       }
     };
@@ -316,7 +320,6 @@ export function useFileSender() {
     const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
     const startTime = Date.now();
     const windowStartRef = { current: Date.now() };
-    const windowBytesRef = { current: 0 };
 
     for (let fi = 0; fi < filesToSend.length; fi++) {
       if (destroyedRef.current) break;
@@ -365,11 +368,11 @@ export function useFileSender() {
           await waitIfPaused(pausedRef, destroyedRef);
           if (destroyedRef.current) break;
 
-          // Backpressure
+          // Backpressure (Allow 20% burst over buffer limit to maintain continuous LAN throughput)
           const dc = conn.dataChannel || conn._dc;
-          if (dc && dc.bufferedAmount > c.buffer) {
+          if (dc && dc.bufferedAmount > c.buffer * 1.2) {
             await new Promise((resolve) => {
-              const check = () => { if (!dc || dc.bufferedAmount < c.bufLow) resolve(); else setTimeout(check, 3); };
+              const check = () => { if (!dc || dc.bufferedAmount < c.bufLow) resolve(); else setTimeout(check, 1); };
               dc.bufferedAmountLowThreshold = c.bufLow;
               const onLow = () => { dc.removeEventListener('bufferedamountlow', onLow); resolve(); };
               dc.addEventListener('bufferedamountlow', onLow);
@@ -381,8 +384,10 @@ export function useFileSender() {
           offset += buf.byteLength;
           updateReceiver(receiverId, { bytesSent: offset });
 
-          // Bandwidth throttle
-          await throttle(speedLimitRef, windowStartRef, windowBytesRef, buf.byteLength, destroyedRef);
+          // Bandwidth throttle (only await if there is actually a limit)
+          if (speedLimitRef.current > 0) {
+            await throttle(speedLimitRef, windowStartRef, buf.byteLength, destroyedRef);
+          }
         }
       }
 
@@ -732,6 +737,20 @@ export function useFileReceiver() {
     chunksRef.current = [];
     if (connRef.current) { connRef.current.close(); connRef.current = null; }
     if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null; }
+    setStatus('idle');
+    setError('');
+    setProgress(0);
+    setSpeed(0);
+    setEta('');
+    setFileList([]);
+    setCurrentFileIndex(0);
+    setCurrentFileName('');
+    setTransferStats(null);
+    setPeerDevice(null);
+    setNetworkMode(null);
+    setChunkTier(null);
+    setActiveChunkSize(0);
+    setCalibrating(false);
   }, []);
 
   useEffect(() => cleanup, [cleanup]);
