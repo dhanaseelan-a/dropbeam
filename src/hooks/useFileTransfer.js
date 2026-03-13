@@ -96,9 +96,8 @@ function playDone() {
 const ICE = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'turn:global.relay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:global.relay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:global.relay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  // Removed public TURN servers as they artificially limit speed to ~300kbps 
+  // on mobile hotspots by forcing a relay instead of attempting local routing
 ];
 
 // ===== NETWORK DETECT =====
@@ -448,8 +447,13 @@ export function useFileSender() {
     setPaused(false);
     if (expiryRef.current) clearTimeout(expiryRef.current);
 
-    const myCode = generateCode();
-    const peer = new Peer(myCode, { config: { iceServers: ICE } });
+    const peer = new Peer(myCode, { 
+      config: { 
+        iceServers: ICE,
+        sdpSemantics: 'unified-plan'
+      },
+      debug: 2 
+    });
 
     peer.on('open', (id) => {
       if (destroyedRef.current) return;
@@ -633,7 +637,13 @@ export function useFileReceiver() {
     setNetworkMode(null);
     setChunkTier(null);
 
-    const peer = new Peer({ config: { iceServers: ICE } });
+    const peer = new Peer({ 
+      config: { 
+        iceServers: ICE,
+        sdpSemantics: 'unified-plan'
+      },
+      debug: 2
+    });
 
     peer.on('open', () => {
       if (destroyedRef.current) return;
