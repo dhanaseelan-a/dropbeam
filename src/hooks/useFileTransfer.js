@@ -17,15 +17,7 @@ const NETWORK_MODES = {
   relay: { label: 'Relay', icon: '☁️', color: '#ef4444', detail: 'Relay — limited speed' },
 };
 
-const SPEED_LIMITS = [
-  { label: 'Unlimited', value: 0 },
-  { label: '256 KB/s', value: 256 * 1024 },
-  { label: '512 KB/s', value: 512 * 1024 },
-  { label: '1 MB/s', value: 1024 * 1024 },
-  { label: '2 MB/s', value: 2 * 1024 * 1024 },
-  { label: '5 MB/s', value: 5 * 1024 * 1024 },
-  { label: '10 MB/s', value: 10 * 1024 * 1024 },
-];
+
 
 
 
@@ -233,37 +225,7 @@ async function waitIfPaused(pausedRef, destroyedRef) {
   });
 }
 
-// ===== BANDWIDTH THROTTLE (Token Bucket) =====
-async function throttle(speedLimitRef, windowStartRef, bytesSent, destroyedRef) {
-  const limit = speedLimitRef.current;
-  if (!limit || limit <= 0) return;
 
-  const msPerByte = 1000 / limit;
-  const costMs = bytesSent * msPerByte;
-  const now = Date.now();
-
-  // Initialize or reset if we fell too far behind (no arbitrary arbitrary buffering)
-  if (!windowStartRef.current || now > windowStartRef.current) {
-    windowStartRef.current = now;
-  }
-
-  windowStartRef.current += costMs;
-  const delay = windowStartRef.current - Date.now();
-
-  if (delay > 10) {
-    let remaining = delay;
-    while (remaining > 0 && !destroyedRef?.current) {
-      const step = Math.min(remaining, 50);
-      await new Promise(r => setTimeout(r, step));
-      remaining -= step;
-      // Break early if speed limit is changed mid-sleep
-      if (speedLimitRef.current !== limit) {
-        windowStartRef.current = Date.now(); // Reset bucket for new limit
-        break;
-      }
-    }
-  }
-}
 
 // ====== SENDER ======
 export function useFileSender() {
@@ -272,7 +234,6 @@ export function useFileSender() {
   const [files, setFiles] = useState([]);
   const [error, setError] = useState('');
   const [codeExpiry, setCodeExpiry] = useState(null);
-  const [speedLimit, setSpeedLimit] = useState(0);
   const [paused, setPaused] = useState(false);
   // Multi-device: array of receiver states
   const [receivers, setReceivers] = useState([]);
@@ -291,37 +252,23 @@ export function useFileSender() {
   useEffect(() => { statusRef.current = status; }, [status]);
   useEffect(() => { filesRef.current = files; }, [files]);
   useEffect(() => { pausedRef.current = paused; }, [paused]);
-  // Sync setters — update ref immediately + state for UI
-  const setSpeedLimitSync = useCallback((v) => { speedLimitRef.current = v; setSpeedLimit(v); }, []);
 
   const updateReceiver = useCallback((id, updates) => {
     setReceivers(prev => prev.map(r => r.id === id ? { ...r, ...updates } : r));
   }, []);
 
   const transferToReceiver = useCallback(async (receiverId, conn, filesToSend, tier) => {
-    // Dynamic config — re-read each file iteration
+    // Dynamic config — auto-scales chunk size based on LIVE receiver speed
     const getConfig = () => {
-      const limit = speedLimitRef.current;
-      
-      // If UNLIMITED, dynamically maximize chunk size to prevent the Receiver Speed Trap.
-      // Since we now internally slice all payloads to 64KB for the SCTP transport layer anyway,
-      // reading massive 10MB file chunks is perfectly safe and allows WebRTC's native backpressure
-      // to handle network congestion naturally without artificially starving the pipeline.
-      if (!limit || limit <= 0) {
-        return CHUNK_TIERS.ultra; // Always use 10MB chunks for unlimited to guarantee maximum throughput
-      }
-
-      // If EXPLICITLY throttled, strictly lock the chunk size to closely match the throttle limit
-      // to prevent the sender from hoarding RAM while ticking slowly.
-      if (limit > 0) {
-        if (limit >= 10 * 1024 * 1024) return { size: 10 * 1024 * 1024, buffer: 20 * 1024 * 1024, bufLow: 5 * 1024 * 1024, pipeline: 1 };
-        if (limit >= 5 * 1024 * 1024) return { size: 4 * 1024 * 1024, buffer: 8 * 1024 * 1024, bufLow: 2 * 1024 * 1024, pipeline: 1 };
-        if (limit >= 2 * 1024 * 1024) return { size: 2 * 1024 * 1024, buffer: 4 * 1024 * 1024, bufLow: 1 * 1024 * 1024, pipeline: 1 };
-        if (limit >= 1 * 1024 * 1024) return { size: 1024 * 1024, buffer: 2 * 1024 * 1024, bufLow: 512 * 1024, pipeline: 1 };
-        return { size: 512 * 1024, buffer: 1024 * 1024, bufLow: 512 * 1024, pipeline: 1 };
-      }
-      
-      return CHUNK_TIERS[tier] || CHUNK_TIERS.balanced;
+      const spd = latestReceiverSpeed;
+      // Aggressively scale chunks based on actual throughput.
+      // Start with calibration tier, upgrade/downgrade dynamically.
+      if (spd > 8 * 1024 * 1024)  return CHUNK_TIERS.ultra;      // > 8 MB/s  → 10MB chunks
+      if (spd > 3 * 1024 * 1024)  return CHUNK_TIERS.lan;        // > 3 MB/s  → 2MB chunks
+      if (spd > 1 * 1024 * 1024)  return CHUNK_TIERS.fast;       // > 1 MB/s  → 1MB chunks
+      if (spd > 500 * 1024)       return CHUNK_TIERS.balanced;   // > 500 KB/s → 512KB chunks
+      if (spd > 0)                return CHUNK_TIERS.unstable;   // < 500 KB/s → 256KB chunks
+      return CHUNK_TIERS[tier] || CHUNK_TIERS.balanced;           // Fallback to calibration
     };
 
     updateReceiver(receiverId, { status: 'transferring', progress: 0, speed: 0, eta: '' });
@@ -350,7 +297,6 @@ export function useFileSender() {
 
     const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
     const startTime = Date.now();
-    const windowStartRef = { current: Date.now() };
 
     for (let fi = 0; fi < filesToSend.length; fi++) {
       if (destroyedRef.current) break;
@@ -445,11 +391,6 @@ export function useFileSender() {
 
           offset += buf.byteLength;
           updateReceiver(receiverId, { bytesSent: offset });
-
-          // Bandwidth throttle (only await if there is actually a limit)
-          if (speedLimitRef.current > 0) {
-            await throttle(speedLimitRef, windowStartRef, buf.byteLength, destroyedRef);
-          }
         }
       }
 
@@ -604,7 +545,6 @@ export function useFileSender() {
 
   return {
     status, code, files, setFiles, error, codeExpiry,
-    speedLimit, setSpeedLimit: setSpeedLimitSync,
     paused, togglePause,
     receivers, initPeer, cleanup, formatBytes
   };
@@ -825,4 +765,4 @@ export function useFileReceiver() {
   };
 }
 
-export { formatBytes, getDeviceName, NETWORK_MODES, CHUNK_TIERS, SPEED_LIMITS };
+export { formatBytes, getDeviceName, NETWORK_MODES, CHUNK_TIERS };

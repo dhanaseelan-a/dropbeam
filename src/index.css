@@ -324,22 +324,8 @@ body::before {
 }
 .ctrl-btn:hover { background: var(--bg-card-hover); color: var(--text-primary); }
 .ctrl-btn.active { background: rgba(59,130,246,0.1); color: var(--accent-primary); border-color: rgba(59,130,246,0.3); }
-
-/* ===== Bandwidth Control ===== */
-.bandwidth-control {
-  padding: 0.75rem; background: var(--bg-secondary); border: 1px solid var(--border-color);
-  border-radius: var(--radius-md); margin-bottom: 0.75rem;
-}
-.bandwidth-label { font-size: 0.65rem; color: var(--text-muted); text-align: center; margin-bottom: 0.5rem; }
-.bandwidth-options { display: flex; flex-wrap: wrap; gap: 0.3rem; justify-content: center; }
-.bandwidth-chip {
-  padding: 0.2rem 0.5rem; border: 1px solid var(--border-color); border-radius: 100px;
-  background: transparent; color: var(--text-muted); font-family: inherit;
-  font-size: 0.6rem; font-weight: 500; cursor: pointer; transition: all var(--transition-fast);
-}
-.bandwidth-chip:hover { color: var(--text-primary); border-color: rgba(255,255,255,0.15); }
-.bandwidth-chip.active { color: var(--accent-primary); border-color: var(--accent-primary); background: rgba(59,130,246,0.08); }
-.bandwidth-hint { font-size: 0.55rem; color: var(--text-muted); text-align: center; margin-top: 0.4rem; opacity: 0.7; }
+.ctrl-btn.cancel { color: var(--error); border-color: rgba(239,68,68,0.25); }
+.ctrl-btn.cancel:hover { background: rgba(239,68,68,0.1); color: #f87171; border-color: rgba(239,68,68,0.4); }
 
 /* ===== Pause Banner ===== */
 .pause-banner {

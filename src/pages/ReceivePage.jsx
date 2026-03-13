@@ -29,6 +29,11 @@ function ReceivePage({ onTransferStateChange }) {
 
   const handleConnect = () => { const c = inputCode.trim().toUpperCase(); if (c.length >= 4) connect(c); };
   const handleReset = () => { cleanup(); setInputCode(''); setAutoConnecting(false); };
+  const handleCancel = () => {
+    if (window.confirm('⚠️ Cancel receiving?\n\nThis will disconnect from the sender and discard any partially received files.')) {
+      handleReset();
+    }
+  };
 
   const radius = 54, circ = 2 * Math.PI * radius;
   const offset = circ - (progress / 100) * circ;
@@ -107,6 +112,11 @@ function ReceivePage({ onTransferStateChange }) {
               <div className="transfer-details">
                 {fileList.length > 1 && <div className="file-counter">File {currentFileIndex + 1} of {fileList.length}</div>}
                 <div className="chunk-counter">{eta} remaining</div>
+              </div>
+              <div style={{ textAlign: 'center', marginTop: '0.75rem' }}>
+                <button className="ctrl-btn cancel" onClick={handleCancel}>
+                  ✕ Cancel Transfer
+                </button>
               </div>
             </div>
           )}

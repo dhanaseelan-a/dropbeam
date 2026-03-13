@@ -2,13 +2,12 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useDropzone } from 'react-dropzone';
 import JSZip from 'jszip';
 import { QRCodeSVG } from 'qrcode.react';
-import { useFileSender, formatBytes, NETWORK_MODES, CHUNK_TIERS, SPEED_LIMITS } from '../hooks/useFileTransfer';
+import { useFileSender, formatBytes, NETWORK_MODES, CHUNK_TIERS } from '../hooks/useFileTransfer';
 import { FilePreview, FileThumbnail, getFileIcon } from '../components/FilePreview';
 
 function SendPage({ onTransferStateChange }) {
   const {
     status, code, files, setFiles, error, codeExpiry,
-    speedLimit, setSpeedLimit,
     paused, togglePause,
     receivers, initPeer, cleanup
   } = useFileSender();
@@ -16,7 +15,6 @@ function SendPage({ onTransferStateChange }) {
   const [copiedLink, setCopiedLink] = useState(false);
   const [expiryCountdown, setExpiryCountdown] = useState('');
   const [previewFile, setPreviewFile] = useState(null);
-  const [showBandwidth, setShowBandwidth] = useState(false);
   const [isZipping, setIsZipping] = useState(false);
 
   const isActive = status === 'transferring' || status === 'waiting' || receivers.some(r => r.status === 'transferring' || r.status === 'calibrating');
@@ -108,6 +106,11 @@ function SendPage({ onTransferStateChange }) {
     if (!next.length) { cleanup(); setFiles([]); } else setFiles(next);
   };
   const handleReset = () => { cleanup(); setFiles([]); setPreviewFile(null); };
+  const handleCancel = () => {
+    if (window.confirm('⚠️ Cancel transfer?\n\nThis will disconnect all receivers and stop the transfer immediately.')) {
+      handleReset();
+    }
+  };
 
   const radius = 54, circ = 2 * Math.PI * radius;
 
@@ -195,27 +198,15 @@ function SendPage({ onTransferStateChange }) {
             </div>
           )}
 
-          {/* === CONTROLS: Pause + Bandwidth === */}
+          {/* === CONTROLS: Pause + Cancel === */}
           {status === 'transferring' && (
             <div className="controls-bar fade-in">
               <button className={`ctrl-btn ${paused ? 'active' : ''}`} onClick={togglePause}>
                 {paused ? '▶ Resume' : '⏸ Pause'}
               </button>
-              <button className={`ctrl-btn ${showBandwidth ? 'active' : ''}`} onClick={() => setShowBandwidth(!showBandwidth)}>
-                ⚡ Speed
+              <button className="ctrl-btn cancel" onClick={handleCancel}>
+                ✕ Cancel
               </button>
-            </div>
-          )}
-
-          {showBandwidth && status === 'transferring' && (
-            <div className="bandwidth-control fade-in">
-              <div className="bandwidth-label">Max Speed: {SPEED_LIMITS.find(s => s.value === speedLimit)?.label || 'Unlimited'}</div>
-              <div className="bandwidth-options">
-                {SPEED_LIMITS.map(s => (
-                  <button key={s.value} className={`bandwidth-chip ${speedLimit === s.value ? 'active' : ''}`}
-                    onClick={() => setSpeedLimit(s.value)}>{s.label}</button>
-                ))}
-              </div>
             </div>
           )}
 
