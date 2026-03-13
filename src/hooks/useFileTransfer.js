@@ -447,6 +447,7 @@ export function useFileSender() {
     setPaused(false);
     if (expiryRef.current) clearTimeout(expiryRef.current);
 
+    const myCode = generateCode();
     const peer = new Peer(myCode, { 
       config: { 
         iceServers: ICE,
