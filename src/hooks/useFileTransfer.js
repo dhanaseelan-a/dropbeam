@@ -139,9 +139,19 @@ async function detectNetwork(conn) {
 
     r.localIP = la; r.remoteIP = ra;
 
+    const isPrivateIP = (ip) => {
+      if (!ip) return false;
+      if (ip.includes(':')) return ip.startsWith('fe80:') || ip.startsWith('fc00:') || ip.startsWith('fd00:');
+      return ip.startsWith('192.168.') || ip.startsWith('10.') || /^172\.(1[6-9]|2\d|3[0-1])\./.test(ip);
+    };
+
     // Default WebRTC classification logic
     if (lt === 'relay' || rt === 'relay') r.mode = 'relay';
-    else if (lt === 'host' && rt === 'host') r.mode = 'lan';
+    else if (lt === 'host' && rt === 'host') {
+      // Two phones on Mobile Data get globally routable IPv6 'host' addresses. These are NOT LANs.
+      if (isPrivateIP(la) && isPrivateIP(ra)) r.mode = 'lan';
+      else r.mode = 'internet';
+    }
     else if ((lt === 'srflx' || rt === 'srflx') && la && ra && la === ra) r.mode = 'wifi';
     else if (lt === 'host' || rt === 'host') r.mode = 'wifi';
     else {
@@ -158,19 +168,19 @@ async function detectNetwork(conn) {
 
     // OVERRIDE: Indian Telecom Carrier-Grade NAT (Jio / Vi / Airtel) Edge Case
     // Two phones on mobile data will often get 10.x.x.x IPs. WebRTC successfully connects them directly
-    // and falsely reports 'lan' because they are technically on the same telco intranet. We must force this to 'internet'.
     const isCGNAT = (ip) => ip.startsWith('10.') && !ip.startsWith('10.43.') && !ip.startsWith('10.0.');
     if (isCGNAT(la) && isCGNAT(ra) && r.mode !== 'relay') {
       r.mode = 'internet'; 
     }
     
     // OVERRIDE: Android Hotspot to Android Mobile Edge Case
-    // Often connects via Server Reflexive instead of Host. We aggressively look for local IP subnets to upgrade them to 'wifi'.
-    const isLocalIP = (ip) => ip.startsWith('192.168.') || ip.startsWith('172.') || ip.startsWith('10.43.');
-    if (isLocalIP(la) && isLocalIP(ra) && r.mode === 'internet') {
+    if (isPrivateIP(la) && isPrivateIP(ra) && r.mode === 'internet') {
       const lp = la.split('.'), rp = ra.split('.');
       if (lp[0] === rp[0] && lp[1] === rp[1]) r.mode = 'wifi';
     }
+
+    // Sync network mode directly to the PeerJS conn object so the UI can force-sync easily
+    conn._networkMode = r.mode;
 
     const m = NETWORK_MODES[r.mode];
     console.log(`%c[DropBeam™] ${m.icon} ${m.label}`, 'color:' + m.color + ';font-weight:bold;font-size:14px');
@@ -293,18 +303,16 @@ export function useFileSender() {
     const getConfig = () => {
       const limit = speedLimitRef.current;
       
-      // Auto-scaling logic (Aggressively ramp up chunks sizes based on LIVE SPEED)
-      let autoTier = tier;
-      const spd = latestReceiverSpeed;
-      if (spd > 8 * 1024 * 1024) autoTier = 'ultra';       // > 8 MB/s = 10MB Chunks
-      else if (spd > 3 * 1024 * 1024) autoTier = 'lan';    // > 3 MB/s = 2MB Chunks
-      else if (spd > 1 * 1024 * 1024) autoTier = 'fast';   // > 1 MB/s = 1MB Chunks
-      else if (spd > 500 * 1024) autoTier = 'balanced';    // > 500 KB/s = 512KB Chunks
-      else if (spd > 0) autoTier = 'unstable';             // < 500 KB/s = 256KB Chunks
+      // If UNLIMITED, dynamically maximize chunk size to prevent the Receiver Speed Trap.
+      // Since we now internally slice all payloads to 64KB for the SCTP transport layer anyway,
+      // reading massive 10MB file chunks is perfectly safe and allows WebRTC's native backpressure
+      // to handle network congestion naturally without artificially starving the pipeline.
+      if (!limit || limit <= 0) {
+        return CHUNK_TIERS.ultra; // Always use 10MB chunks for unlimited to guarantee maximum throughput
+      }
 
-      let config = CHUNK_TIERS[autoTier] || CHUNK_TIERS.balanced;
-
-      // Allow massive chunks if explicitly requested by limit, bounded only by 10MB absolute ceiling
+      // If EXPLICITLY throttled, strictly lock the chunk size to closely match the throttle limit
+      // to prevent the sender from hoarding RAM while ticking slowly.
       if (limit > 0) {
         if (limit >= 10 * 1024 * 1024) return { size: 10 * 1024 * 1024, buffer: 20 * 1024 * 1024, bufLow: 5 * 1024 * 1024, pipeline: 1 };
         if (limit >= 5 * 1024 * 1024) return { size: 4 * 1024 * 1024, buffer: 8 * 1024 * 1024, bufLow: 2 * 1024 * 1024, pipeline: 1 };
@@ -313,7 +321,7 @@ export function useFileSender() {
         return { size: 512 * 1024, buffer: 1024 * 1024, bufLow: 512 * 1024, pipeline: 1 };
       }
       
-      return config;
+      return CHUNK_TIERS[tier] || CHUNK_TIERS.balanced;
     };
 
     updateReceiver(receiverId, { status: 'transferring', progress: 0, speed: 0, eta: '' });
