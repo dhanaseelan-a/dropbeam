@@ -46,19 +46,18 @@ function SendPage({ onTransferStateChange }) {
       // If there is no relative path, or the relative path is just the filename, it's not in a folder
       if (!relPath || relPath === f.name) {
         groups.root.push(f);
-        continue;
-      }
-
-      const parts = relPath.replace(/^\//, '').split('/');
-      
-      // If it has multiple parts in the webkitRelativePath, it came from a dropped folder
-      if (parts.length > 1) {
-        hasFolders = true;
-        const topFolder = parts[0];
-        if (!groups[topFolder]) groups[topFolder] = [];
-        groups[topFolder].push({ file: f, path: parts.slice(1).join('/') });
       } else {
-        groups.root.push(f);
+        const parts = relPath.replace(/^\//, '').split('/');
+        
+        // If it has multiple parts in the webkitRelativePath, it came from a dropped folder
+        if (parts.length > 1) {
+          hasFolders = true;
+          const topFolder = parts[0];
+          if (!groups[topFolder]) groups[topFolder] = [];
+          groups[topFolder].push({ file: f, path: parts.slice(1).join('/') });
+        } else {
+          groups.root.push(f);
+        }
       }
     }
 
