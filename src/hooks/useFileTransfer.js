@@ -142,7 +142,7 @@ async function detectNetwork(conn) {
     });
 
     if (lt === 'relay' || rt === 'relay') {
-      r.mode = hasWorkingHostPair ? 'wifi' : 'relay';
+      r.mode = 'relay'; // If it's physically using a relay, it IS a relay connection, regardless of local host pairs
     } else if (lt === 'host' && rt === 'host') {
       r.mode = 'lan';
     } else if (hasWorkingHostPair) {
