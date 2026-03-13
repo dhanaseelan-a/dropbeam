@@ -39,9 +39,19 @@ function SendPage({ onTransferStateChange }) {
     let hasFolders = false;
 
     for (const f of acceptedFiles) {
-      const relPath = f.webkitRelativePath || f.path || '';
+      // Mobile devices sometimes provide fake paths for photos (e.g. /image/123.jpg)
+      // Real dragged folders usually have webkitRelativePath set properly by the browser.
+      const relPath = f.webkitRelativePath || ''; 
+
+      // If there is no relative path, or the relative path is just the filename, it's not in a folder
+      if (!relPath || relPath === f.name) {
+        groups.root.push(f);
+        continue;
+      }
+
       const parts = relPath.replace(/^\//, '').split('/');
       
+      // If it has multiple parts in the webkitRelativePath, it came from a dropped folder
       if (parts.length > 1) {
         hasFolders = true;
         const topFolder = parts[0];
