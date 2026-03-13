@@ -372,10 +372,20 @@ export function useFileSender() {
           const dc = conn.dataChannel || conn._dc;
           if (dc && dc.bufferedAmount > c.buffer * 1.2) {
             await new Promise((resolve) => {
-              const check = () => { if (!dc || dc.bufferedAmount < c.bufLow) resolve(); else setTimeout(check, 1); };
+              let resolved = false;
+              const cleanup = () => { 
+                if (resolved) return;
+                resolved = true;
+                dc.removeEventListener('bufferedamountlow', cleanup); 
+                resolve(); 
+              };
               dc.bufferedAmountLowThreshold = c.bufLow;
-              const onLow = () => { dc.removeEventListener('bufferedamountlow', onLow); resolve(); };
-              dc.addEventListener('bufferedamountlow', onLow);
+              dc.addEventListener('bufferedamountlow', cleanup);
+              const check = () => { 
+                if (resolved) return;
+                if (!dc || dc.bufferedAmount < c.bufLow) cleanup(); 
+                else setTimeout(check, 10); 
+              };
               setTimeout(check, 10);
             });
           }
