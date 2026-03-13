@@ -277,8 +277,8 @@ export function useFileSender() {
 
       // Enforce very tight backpressure to match throttle limits (prevent WebRTC buffering 50MB instantly)
       if (limit > 0) {
-        // Force chunk size to cover max 0.25s of data, max 256KB
-        const constrainedSize = Math.max(16 * 1024, Math.min(config.size, Math.floor(limit / 4), 256 * 1024));
+        // Force chunk size to cover max 0.25s of data, max 1MB for large speed limits
+        const constrainedSize = Math.max(16 * 1024, Math.min(config.size, Math.floor(limit / 4), 1024 * 1024));
         return { size: constrainedSize, buffer: constrainedSize * 2, bufLow: constrainedSize, pipeline: 1 };
       }
       
@@ -390,7 +390,15 @@ export function useFileSender() {
             });
           }
 
-          conn.send(buf);
+          // WebRTC MTU Optimization: Sending > 64KB in a single frame can cause severe SCTP packet loss/stalling on WiFi.
+          // We slice the large memory buffer into zero-copy 64KB chunks for the actual DataChannel transfer.
+          const u8 = new Uint8Array(buf);
+          const MAX_PAYLOAD = 64 * 1024;
+          for (let pByte = 0; pByte < u8.byteLength; pByte += MAX_PAYLOAD) {
+            const chunkView = new Uint8Array(u8.buffer, u8.byteOffset + pByte, Math.min(MAX_PAYLOAD, u8.byteLength - pByte));
+            conn.send(chunkView);
+          }
+
           offset += buf.byteLength;
           updateReceiver(receiverId, { bytesSent: offset });
 
