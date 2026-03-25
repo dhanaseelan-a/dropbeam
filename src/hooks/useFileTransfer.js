@@ -625,7 +625,8 @@ export function useFileReceiver() {
     chunksRef.current.push(arr);
     receivedSizeRef.current += arr.byteLength;
     grandReceivedRef.current += arr.byteLength;
-    const pct = Math.min(99, Math.round((grandReceivedRef.current / grandTotalRef.current) * 100));
+    const isComplete = grandReceivedRef.current >= grandTotalRef.current;
+    const pct = isComplete ? 100 : Math.min(99, Math.round((grandReceivedRef.current / grandTotalRef.current) * 100));
     setProgress(pct);
     sendAck(pct);
   }, [sendAck]);
@@ -648,7 +649,7 @@ export function useFileReceiver() {
 
     peer.on('open', () => {
       if (destroyedRef.current) return;
-      const conn = peer.connect(code.toUpperCase(), { reliable: true });
+      const conn = peer.connect(code.toUpperCase());
 
       conn.on('open', async () => {
         if (destroyedRef.current) return;

@@ -34,12 +34,19 @@ function SendPage({ onTransferStateChange }) {
   const onDrop = useCallback(async (acceptedFiles) => {
     if (!acceptedFiles.length) return;
 
+    // Filter out OS hidden files and MS Office temp lock files
+    const validFiles = acceptedFiles.filter(f => {
+      const n = f.name;
+      return !n.startsWith('~$') && !n.startsWith('._') && n !== '.DS_Store';
+    });
+    if (!validFiles.length) return;
+
     // Check for folders
     const groups = { root: [] };
     let hasFolders = false;
 
     // For Android/iOS image selection and standard non-folder files
-    for (const f of acceptedFiles) {
+    for (const f of validFiles) {
       const pathStr = f.webkitRelativePath || ''; 
       const parts = pathStr.split('/').filter(Boolean);
 
