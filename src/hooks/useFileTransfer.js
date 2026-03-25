@@ -301,7 +301,7 @@ export function useFileSender() {
     const startTime = Date.now();
 
     for (let fi = 0; fi < filesToSend.length; fi++) {
-      if (destroyedRef.current) break;
+      if (destroyedRef.current || conn._cancelled) break;
       const file = filesToSend[fi];
       updateReceiver(receiverId, { currentFile: fi });
 
@@ -314,11 +314,11 @@ export function useFileSender() {
       updateReceiver(receiverId, { bytesSent: 0, bytesTotal: file.size, activeChunkSize: cfg.size });
 
       while (offset < file.size) {
-        if (destroyedRef.current) break;
+        if (destroyedRef.current || conn._cancelled) break;
 
         // Pause check
         await waitIfPaused(pausedRef, destroyedRef);
-        if (destroyedRef.current) break;
+        if (destroyedRef.current || conn._cancelled) break;
 
         // Re-read config before pipelining to allow instant slider changes
         let c = getConfig();
@@ -354,11 +354,11 @@ export function useFileSender() {
         // Calculate maximum bytes we can send in this cluster to prevent over-sending file size
         for (let i = 0; i < buffers.length; i++) {
           const buf = buffers[i];
-          if (!buf || destroyedRef.current) break;
+          if (!buf || destroyedRef.current || conn._cancelled) break;
           if (offset >= file.size) break;
 
           await waitIfPaused(pausedRef, destroyedRef);
-          if (destroyedRef.current) break;
+          if (destroyedRef.current || conn._cancelled) break;
 
           // Backpressure (Allow 20% burst over buffer limit to maintain continuous LAN throughput)
           const dc = conn.dataChannel || conn._dc;
@@ -418,13 +418,18 @@ export function useFileSender() {
       conn.on('data', waitBytes);
       
       checkInterval = setInterval(() => {
-        if (destroyedRef.current || latestReceiverBytes >= grandTotal) {
+        if (destroyedRef.current || conn._cancelled || latestReceiverBytes >= grandTotal) {
           conn.off('data', waitBytes);
           clearInterval(checkInterval);
           resolve();
         }
       }, 200);
     });
+
+    if (destroyedRef.current || conn._cancelled) {
+      updateReceiver(receiverId, { status: 'disconnected' });
+      return;
+    }
 
     conn.send({ type: 'all-done' });
 
@@ -504,6 +509,10 @@ export function useFileSender() {
         if (data?.type === 'device-info' && !isBinary(data)) {
           updateReceiver(receiverId, { device: data.device || '' });
         }
+        if (data?.type === 'cancel' && !isBinary(data)) {
+          conn._cancelled = true;
+          updateReceiver(receiverId, { status: 'disconnected', error: 'Cancelled by receiver' });
+        }
       });
 
       conn.on('close', () => {
@@ -535,7 +544,12 @@ export function useFileSender() {
   const cleanup = useCallback(() => {
     destroyedRef.current = true;
     if (expiryRef.current) clearTimeout(expiryRef.current);
-    receiversRef.current.forEach(r => { try { r.conn?.close(); } catch (e) {} });
+    receiversRef.current.forEach(r => { 
+      try { 
+        if (r.conn && r.conn.open) r.conn.send({ type: 'cancel' });
+        r.conn?.close(); 
+      } catch (e) {} 
+    });
     receiversRef.current = [];
     if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null; }
     setStatus('idle');
@@ -673,6 +687,11 @@ export function useFileReceiver() {
           if (data.type === 'cal-start') return;
           if (data.type === 'cal-done') return;
           if (data.type === 'rejected') { setError(data.reason || 'Rejected'); setStatus('error'); return; }
+          if (data.type === 'cancel') {
+            setError('Transfer cancelled by sender');
+            setStatus('error');
+            return;
+          }
 
           if (data.type === 'file-list') {
             setFileList(data.files || []);
@@ -758,7 +777,11 @@ export function useFileReceiver() {
   const cleanup = useCallback(() => {
     destroyedRef.current = true;
     chunksRef.current = [];
-    if (connRef.current) { connRef.current.close(); connRef.current = null; }
+    if (connRef.current) { 
+      try { if (connRef.current.open) connRef.current.send({ type: 'cancel' }); } catch(e){}
+      connRef.current.close(); 
+      connRef.current = null; 
+    }
     if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null; }
     setStatus('idle');
     setError('');
