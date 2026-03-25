@@ -3,9 +3,9 @@ import Peer from 'peerjs';
 
 // ===== CHUNK TIERS (Hyper-Optimized for Speed) =====
 const CHUNK_TIERS = {
-  unstable: { size: 128 * 1024, label: 'Unstable',   buffer: 1 * 1024 * 1024,  bufLow: 256 * 1024, pipeline: 4 },
-  balanced: { size: 256 * 1024, label: 'Balanced',   buffer: 2 * 1024 * 1024,  bufLow: 512 * 1024, pipeline: 6 },
-  fast:     { size: 512 * 1024, label: 'Fast',      buffer: 8 * 1024 * 1024,  bufLow: 2 * 1024 * 1024, pipeline: 8 },
+  unstable: { size: 64 * 1024,  label: 'Unstable',   buffer: 256 * 1024,  bufLow: 64 * 1024, pipeline: 2 },
+  balanced: { size: 128 * 1024, label: 'Balanced',   buffer: 512 * 1024,  bufLow: 128 * 1024, pipeline: 4 },
+  fast:     { size: 512 * 1024, label: 'Fast',       buffer: 2 * 1024 * 1024,  bufLow: 512 * 1024, pipeline: 8 },
   lan:      { size: 2 * 1024 * 1024, label: 'LAN',   buffer: 16 * 1024 * 1024, bufLow: 4 * 1024 * 1024, pipeline: 8 },
   ultra:    { size: 4 * 1024 * 1024, label: 'Ultra', buffer: 32 * 1024 * 1024, bufLow: 8 * 1024 * 1024, pipeline: 4 },
 };
@@ -538,6 +538,10 @@ export function useFileSender() {
     receiversRef.current.forEach(r => { try { r.conn?.close(); } catch (e) {} });
     receiversRef.current = [];
     if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null; }
+    setStatus('idle');
+    setCode('');
+    setReceivers([]);
+    setPaused(false);
   }, []);
 
   useEffect(() => cleanup, [cleanup]);
