@@ -2,11 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 64 * 1024;        // 64KB — Max size that reliably prevents 0b crashes
-const MAX_CHUNK  = 64 * 1024;        // 64KB
-const BUF_HI     = 8 * 1024 * 1024;  // 8MB — Extreme buffer for massive internet BDP (5MB/s+)
-const BUF_LO     = 2 * 1024 * 1024;  // 2MB — Low watermark
-const READ_AHEAD = 128;              // Run 128 loops (8MB batches)
+const CHUNK_SIZE = 16 * 1024;        // 16KB — Safe starting chunk to probe network limits
+const MAX_CHUNK  = 1024 * 1024;      // 1MB — User-requested ultra-high maximal chunk
+const BUF_HI     = 4 * 1024 * 1024;  // 4MB — High watermark
+const BUF_LO     = 1024 * 1024;      // 1MB — Low watermark
+const READ_AHEAD = 64;               // Run 64 loops at a time
 const ACK_INTERVAL = 400;            // Receiver ACK interval (ms)
 const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
 
@@ -23,9 +23,17 @@ const CHUNK_TIERS = {
   fast:   { size: 256 * 1024,  label: 'Fast',   bufHi: 2 * 1024 * 1024,  ahead: 32 },
 };
 
-// ===== ADAPTIVE CHUNK SIZING REMOVED =====
-function getAdaptiveChunk() {
-  return CHUNK_SIZE; // Always 64KB
+// ===== ADAPTIVE CHUNK SIZING =====
+// Dynamically scales chunk size from 16KB all the way up to 1MB based on true network speed.
+function getAdaptiveChunk(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
+  const kbps = bytesPerSec / 1024;
+  if (kbps < 300) return 32 * 1024;      // <300 KB/s → 32KB
+  if (kbps < 1000) return 64 * 1024;     // <1 MB/s  → 64KB
+  if (kbps < 2500) return 128 * 1024;    // <2.5 MB/s → 128KB
+  if (kbps < 5000) return 256 * 1024;    // <5 MB/s   → 256KB
+  if (kbps < 8000) return 512 * 1024;    // <8 MB/s   → 512KB
+  return MAX_CHUNK;                      // Fast      → 1MB (Extreme)
 }
 
 // ===== SPEED LABEL =====
@@ -278,6 +286,7 @@ export function useFileSender() {
             if (msg.speed > 0) {
               updObj.speed = msg.speed;
               updObj.speedLabel = getSpeedLabel(msg.speed);
+              currentSpeed = msg.speed; // Store speed perfectly for sender adaptive loop
             }
             updateReceiver(receiverId, updObj);
           }
@@ -312,6 +321,16 @@ export function useFileSender() {
       const displayBytes = globalBytesSent;
       const pct = grandTotal > 0 ? Math.min(99, Math.round((displayBytes / grandTotal) * 100)) : 0;
       const totalChunks = Math.ceil(grandTotal / currentChunkSize);
+
+      // Adaptive Check -> use the 'currentSpeed' harvested from receiver ACKs!
+      if (currentSpeed > 0) {
+        const nextChunkSize = getAdaptiveChunk(currentSpeed);
+        if (nextChunkSize !== lastSentChunkSize) {
+          lastSentChunkSize = nextChunkSize;
+          currentChunkSize = nextChunkSize;
+          dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
+        }
+      }
 
       updateReceiver(receiverId, {
         bytesSent: displayBytes,
@@ -370,14 +389,23 @@ export function useFileSender() {
           if (destroyedRef.current || conn._cancelled) break;
           if (!dc || dc.readyState !== 'open') break;
 
-          const end = Math.min(pos + currentChunkSize, bigView.length);
+          let end = Math.min(pos + currentChunkSize, bigView.length);
           // subarray = zero-copy view (no allocation)
-          const chunk = bigView.subarray(pos, end);
+          let chunk = bigView.subarray(pos, end);
 
           try {
             dc.send(chunk);
           } catch (err) {
-            // Buffer overflow — wait for drain and retry once
+            // Buffer overflow OR WebRTC Message Too Large Exception
+            if (err.name === 'TypeError' || String(err).includes('too large') || currentChunkSize > 256 * 1024) {
+               // Browser strictly rejected 1MB or 512KB chunks. Step down permanently.
+               currentChunkSize = Math.max(16 * 1024, Math.floor(currentChunkSize / 2));
+               lastSentChunkSize = currentChunkSize;
+               dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
+               end = Math.min(pos + currentChunkSize, bigView.length);
+               chunk = bigView.subarray(pos, end);
+            }
+
             await waitForDrain(dc);
             if (!dc || dc.readyState !== 'open') break;
             try {
