@@ -297,6 +297,10 @@ body::before {
 @keyframes success-pop { 0% { transform: scale(0); } 50% { transform: scale(1.2); } 100% { transform: scale(1); } }
 .complete-title { font-size: 1.15rem; font-weight: 700; margin-bottom: 0.2rem; }
 .complete-subtitle { color: var(--text-secondary); font-size: 0.8rem; }
+.complete-time {
+  font-size: 0.7rem; color: var(--text-muted); margin-top: 0.35rem;
+  display: flex; align-items: center; justify-content: center; gap: 0.3rem;
+}
 
 /* ===== Expiry Badge ===== */
 .expiry-badge {
@@ -358,10 +362,50 @@ body::before {
   font-size: 0.55rem; font-weight: 800; color: var(--text-primary);
 }
 .receiver-info { flex: 1; min-width: 0; }
+.receiver-speed-row {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+}
 .receiver-speed { font-size: 0.75rem; font-weight: 700; color: var(--text-primary); }
-.receiver-meta { font-size: 0.6rem; color: var(--text-muted); }
-.receiver-chunks { font-size: 0.55rem; color: var(--text-muted); }
+.speed-chip {
+  display: inline-flex; align-items: center; gap: 0.2rem;
+  padding: 0.1rem 0.45rem; border-radius: 100px;
+  font-size: 0.55rem; font-weight: 600;
+  color: var(--speed-color, var(--accent-primary));
+  background: color-mix(in srgb, var(--speed-color, var(--accent-primary)) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--speed-color, var(--accent-primary)) 20%, transparent);
+  line-height: 1.3;
+}
+.speed-chip-center {
+  display: inline-flex; align-items: center; gap: 0.25rem;
+  padding: 0.2rem 0.6rem; border-radius: 100px;
+  font-size: 0.65rem; font-weight: 600;
+  color: var(--speed-color, var(--accent-primary));
+  background: color-mix(in srgb, var(--speed-color, var(--accent-primary)) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--speed-color, var(--accent-primary)) 20%, transparent);
+}
+.speed-chip-center.done { margin-top: 0.4rem; }
+.speed-chip-detail { opacity: 0.8; }
+.receiver-meta { font-size: 0.6rem; color: var(--text-muted); margin-top: 0.15rem; }
+.receiver-chunks { font-size: 0.55rem; color: var(--text-muted); margin-top: 0.1rem; }
 .receiver-done { font-size: 0.65rem; color: var(--success); }
+.done-stats { margin-bottom: 0.15rem; }
+.done-time { font-size: 0.6rem; color: var(--text-muted); opacity: 0.8; }
+.receiver-cancelled {
+  font-size: 0.65rem; color: var(--error);
+  display: flex; align-items: center; gap: 0.3rem;
+}
+.file-cancel-badge {
+  font-size: 0.65rem; font-weight: 700; color: var(--error); flex-shrink: 0;
+  width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
+  background: var(--error-bg); border-radius: 50%;
+}
+
+/* ===== Remote Pause Banner ===== */
+.remote-pause-banner {
+  text-align: center; padding: 0.35rem 0.6rem; border-radius: var(--radius-md);
+  background: rgba(168, 85, 247, 0.08); border: 1px solid rgba(168, 85, 247, 0.18);
+  color: #a855f7; font-size: 0.65rem; font-weight: 600; margin-bottom: 0.5rem;
+}
 
 /* ===== File Preview ===== */
 .file-preview-section {

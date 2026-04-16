@@ -97,6 +97,25 @@ function playDone() {
 const ICE = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' },
+  // Free TURN servers for relay fallback (improves internet connectivity)
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
 
 function getDC(conn) {
@@ -478,11 +497,13 @@ export function useFileSender() {
     dcSendJSON(dc, { type: 'all-done' });
 
     const totalTime = (Date.now() - startTime) / 1000;
+    const completionTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
     updateReceiver(receiverId, {
       status: 'done', progress: 100,
       avgSpeed: grandTotal / totalTime,
       totalTime, totalBytes: grandTotal,
       speedLabel: getSpeedLabel(grandTotal / totalTime),
+      completionTime,
     });
     playDone();
   }, [updateReceiver]);
@@ -846,11 +867,13 @@ export function useFileReceiver() {
         stopAckTimer();
         const tt = (Date.now() - startTimeRef.current) / 1000;
         const avgSpd = grandReceivedRef.current / tt;
+        const completionTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
         setTransferStats({
           totalBytes: grandReceivedRef.current, totalTime: tt,
           avgSpeed: avgSpd,
           fileCount: fileListRef.current.length || 1,
           speedLabel: getSpeedLabel(avgSpd),
+          completionTime,
         });
         setProgress(100);
         setStatus('done');

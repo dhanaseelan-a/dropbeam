@@ -271,7 +271,7 @@ function SendPage({ onTransferStateChange }) {
                       <>
                         {/* Remote pause banner */}
                         {r.remotePaused && (
-                          <div className="remote-pause-banner fade-in">⏸ Receiver paused</div>
+                          <div className="remote-pause-banner fade-in">⏸ Receiver paused transfer</div>
                         )}
 
                         <div className="receiver-progress">
@@ -283,15 +283,16 @@ function SendPage({ onTransferStateChange }) {
                             <span className="mini-ring-pct">{displayProgress}%</span>
                           </div>
                           <div className="receiver-info">
-                            <div className="receiver-speed">{formatBytes(displaySpeed)}/s</div>
-                            {/* Speed label indicator */}
-                            {displaySpeedLabel && displaySpeedLabel.tier !== 'waiting' && (
-                              <div className="speed-indicator" style={{ '--speed-color': displaySpeedLabel.color }}>
-                                {displaySpeedLabel.label}
-                              </div>
-                            )}
+                            <div className="receiver-speed-row">
+                              <span className="receiver-speed">{formatBytes(displaySpeed)}/s</span>
+                              {displaySpeedLabel && displaySpeedLabel.tier !== 'waiting' && (
+                                <span className="speed-chip" style={{ '--speed-color': displaySpeedLabel.color }}>
+                                  {displaySpeedLabel.label}
+                                </span>
+                              )}
+                            </div>
                             <div className="receiver-meta">
-                              {displayEta && <span>{displayEta} remaining</span>}
+                              {displayEta && <span>⏱ {displayEta} remaining</span>}
                             </div>
                             <div className="receiver-chunks">{formatBytes(r.bytesSent)} / {formatBytes(r.bytesTotal)}</div>
                           </div>
@@ -313,7 +314,12 @@ function SendPage({ onTransferStateChange }) {
 
                     {r.status === 'done' && (
                       <div className="receiver-done">
-                        <span>{formatBytes(r.totalBytes)} · {r.totalTime?.toFixed(1)}s · avg {formatBytes(r.avgSpeed)}/s</span>
+                        <div className="done-stats">
+                          <span>{formatBytes(r.totalBytes)} · {r.totalTime?.toFixed(1)}s · avg {formatBytes(r.avgSpeed)}/s</span>
+                        </div>
+                        {r.completionTime && (
+                          <div className="done-time">Completed at {r.completionTime}</div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -326,6 +332,7 @@ function SendPage({ onTransferStateChange }) {
             <div className="complete-section fade-in">
               <div className="complete-icon">✓</div>
               <div className="complete-title">All Transfers Complete</div>
+              <div className="complete-time">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })}</div>
               {expiryCountdown && <div className="expiry-badge">Code expires in {expiryCountdown}</div>}
               <button className="btn btn-secondary" onClick={handleSendMore} style={{ marginTop: '1rem' }}>Send more files</button>
             </div>

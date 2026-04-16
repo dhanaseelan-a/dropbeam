@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react';
-import { useFileReceiver, formatBytes, NETWORK_MODES } from '../hooks/useFileTransfer';
+import { useFileReceiver, formatBytes, NETWORK_MODES, getSpeedLabel } from '../hooks/useFileTransfer';
 import { getFileIcon } from '../components/FilePreview';
 
 function ReceivePage({ onTransferStateChange }) {
   const {
-    status, progress, speed, eta, error,
+    status, progress, speed, speedRaw, eta, error,
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, activeChunkSize,
-    networkMode, connect, cleanup
+    networkMode, speedLabel, remotePaused, paused, togglePause,
+    connect, cleanup
   } = useFileReceiver();
   const [inputCode, setInputCode] = useState('');
   const [autoConnecting, setAutoConnecting] = useState(false);
@@ -38,6 +39,7 @@ function ReceivePage({ onTransferStateChange }) {
   const radius = 54, circ = 2 * Math.PI * radius;
   const offset = circ - (progress / 100) * circ;
   const net = networkMode ? NETWORK_MODES[networkMode] : null;
+  const displaySpeedLabel = speedLabel || getSpeedLabel(0);
 
   return (
     <div className="fade-in">
@@ -92,6 +94,15 @@ function ReceivePage({ onTransferStateChange }) {
                   {networkMode && <div className="network-chip" style={{ '--net-color': NETWORK_MODES[networkMode].color }}>{NETWORK_MODES[networkMode].icon} {NETWORK_MODES[networkMode].label}</div>}
                 </div>
               )}
+
+              {/* Pause banners */}
+              {remotePaused && (
+                <div className="remote-pause-banner fade-in">⏸ Sender paused transfer</div>
+              )}
+              {paused && (
+                <div className="pause-banner fade-in">⏸ Transfer paused by you</div>
+              )}
+
               <div className="ring-container">
                 <svg className="ring-svg" viewBox="0 0 120 120">
                   <circle cx="60" cy="60" r={radius} className="ring-track" />
@@ -102,13 +113,27 @@ function ReceivePage({ onTransferStateChange }) {
                   <div className="ring-speed">{speed}</div>
                 </div>
               </div>
+
+              {/* Speed label indicator */}
+              {displaySpeedLabel && displaySpeedLabel.tier !== 'waiting' && (
+                <div className="speed-chip-center" style={{ '--speed-color': displaySpeedLabel.color }}>
+                  {displaySpeedLabel.label}
+                  {displaySpeedLabel.detail && <span className="speed-chip-detail"> · {displaySpeedLabel.detail}</span>}
+                </div>
+              )}
+
               <div className="transfer-details">
                 {fileList.length > 1 && <div className="file-counter">File {currentFileIndex + 1} of {fileList.length}</div>}
-                <div className="chunk-counter">{eta} remaining</div>
+                <div className="chunk-counter">⏱ {eta} remaining</div>
               </div>
-              <div style={{ textAlign: 'center', marginTop: '0.75rem' }}>
+
+              {/* Controls: Pause + Cancel */}
+              <div className="controls-bar">
+                <button className={`ctrl-btn ${paused ? 'active' : ''}`} onClick={togglePause}>
+                  {paused ? '▶ Resume' : '⏸ Pause'}
+                </button>
                 <button className="ctrl-btn cancel" onClick={handleCancel}>
-                  ✕ Cancel Transfer
+                  ✕ Cancel
                 </button>
               </div>
             </div>
@@ -122,13 +147,23 @@ function ReceivePage({ onTransferStateChange }) {
             <div className="complete-icon">✓</div>
             <div className="complete-title">Received</div>
             {transferStats && (
-              <div className="transfer-stats">
-                <span>{transferStats.fileCount > 1 ? `${transferStats.fileCount} files · ` : ''}{formatBytes(transferStats.totalBytes)}</span>
-                <span className="stats-dot">·</span>
-                <span>{transferStats.totalTime.toFixed(1)}s</span>
-                <span className="stats-dot">·</span>
-                <span>avg {formatBytes(transferStats.avgSpeed)}/s</span>
-              </div>
+              <>
+                <div className="transfer-stats">
+                  <span>{transferStats.fileCount > 1 ? `${transferStats.fileCount} files · ` : ''}{formatBytes(transferStats.totalBytes)}</span>
+                  <span className="stats-dot">·</span>
+                  <span>{transferStats.totalTime.toFixed(1)}s</span>
+                  <span className="stats-dot">·</span>
+                  <span>avg {formatBytes(transferStats.avgSpeed)}/s</span>
+                </div>
+                {transferStats.speedLabel && transferStats.speedLabel.tier !== 'waiting' && (
+                  <div className="speed-chip-center done" style={{ '--speed-color': transferStats.speedLabel.color }}>
+                    {transferStats.speedLabel.label}
+                  </div>
+                )}
+                {transferStats.completionTime && (
+                  <div className="complete-time">Completed at {transferStats.completionTime}</div>
+                )}
+              </>
             )}
             {net && <div className="network-chip done" style={{ '--net-color': net.color }}>{net.icon} {net.label}</div>}
             <div className="complete-subtitle" style={{ marginTop: '0.25rem' }}>{fileList.length > 1 ? `${fileList.length} files` : currentFileName} saved</div>
