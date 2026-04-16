@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 128 * 1024;       // 128KB — large starting chunk
+const CHUNK_SIZE = 128 * 1024;       // 128KB — aggressive starting chunk for fast ramp-up
 const MAX_CHUNK  = 256 * 1024;       // 256KB — max safe SCTP message
 const BUF_HI     = 4 * 1024 * 1024;  // 4MB — Massive HIGH watermark for high-latency throughput
 const BUF_LO     = 1024 * 1024;      // 1MB — LOW watermark
@@ -306,66 +306,23 @@ export function useFileSender() {
       }
     };
 
-    // ===== PROGRESS TIMER — runs every 200ms, decoupled from send loop =====
-    // This fixes:
-    //   1. "0 B" bug — uses globalBytesSent directly (not subtracted by bufferedAmount)
-    //   2. Speed=0 bug — samples are taken at real 200ms intervals, not per-chunk
-    //   3. Performance — all formatting (toLocaleTimeString, getSpeedLabel) moved here
-    let prevSampleTime = Date.now();
-    let prevSampleBytes = 0;
-    const speedWindow = []; // rolling 3-second window
-
+    // ===== PROGRESS TIMER — runs every 200ms =====
+    // We strictly use receiver ACKs for speed, avoiding local dc.bufferedAmount glitches 
+    // that falsely reported 0 B/s on fast connections.
     const progressTimer = setInterval(() => {
       if (transferDone) return;
       const now = Date.now();
 
-      // ---- Speed: track actual bytes leaving the buffer (drain rate) ----
-      // bytesOnWire = bytes sent minus what's still in the buffer
-      const bytesOnWire = Math.max(0, globalBytesSent - (dc.bufferedAmount || 0));
-      speedWindow.push({ time: now, bytes: bytesOnWire });
-
-      // Trim to last 3 seconds
-      while (speedWindow.length > 2 && now - speedWindow[0].time > 3000) {
-        speedWindow.shift();
-      }
-
-      if (speedWindow.length >= 2) {
-        const oldest = speedWindow[0];
-        const dt = (now - oldest.time) / 1000;
-        if (dt > 0.1) { // need at least 100ms of data
-          currentSpeed = (bytesOnWire - oldest.bytes) / dt;
-        }
-      }
-
-      // ---- Adaptive chunk sizing ----
-      if (currentSpeed > 0) {
-        currentChunkSize = getAdaptiveChunk(currentSpeed);
-        if (currentChunkSize !== lastSentChunkSize) {
-          lastSentChunkSize = currentChunkSize;
-          dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
-        }
-      }
-
-      // ---- Progress ----
-      // Use globalBytesSent for immediate feedback (not bytesOnWire which causes "0 B")
+      // We only compute immediate display progress (bytes sent locally).
+      // Speed and ETA are exclusively calculated by the Receiver's ACKs to avoid 0B glitches.
       const displayBytes = globalBytesSent;
       const pct = grandTotal > 0 ? Math.min(99, Math.round((displayBytes / grandTotal) * 100)) : 0;
-      const remaining = grandTotal - displayBytes;
-      const remainingSec = currentSpeed > 0 ? remaining / currentSpeed : 0;
-      const eta = currentSpeed > 0 ? formatTime(remainingSec) : '--:--';
-      const etc = currentSpeed > 0
-        ? new Date(now + remainingSec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
-        : '';
       const totalChunks = Math.ceil(grandTotal / currentChunkSize);
 
       updateReceiver(receiverId, {
         bytesSent: displayBytes,
         bytesTotal: grandTotal,
         senderProgress: pct,
-        senderSpeed: currentSpeed,
-        senderEta: eta,
-        senderEtc: etc,
-        senderSpeedLabel: getSpeedLabel(currentSpeed),
         activeChunkSize: currentChunkSize,
         chunksSent,
         totalChunks,
@@ -415,6 +372,7 @@ export function useFileSender() {
         // Only: send, increment counters, backpressure check
         // NO speed tracking, NO formatting, NO object creation
         let pos = 0;
+        let sentSinceYield = 0;
         while (pos < bigView.length) {
           if (destroyedRef.current || conn._cancelled) break;
           if (!dc || dc.readyState !== 'open') break;
@@ -443,10 +401,17 @@ export function useFileSender() {
           pos += chunk.byteLength;
           globalBytesSent += chunk.byteLength;
           chunksSent++;
+          
+          sentSinceYield += chunk.byteLength;
 
           // Backpressure — only wait when buffer exceeds HIGH watermark
           if (dc.bufferedAmount > BUF_HI) {
             await waitForDrain(dc);
+            sentSinceYield = 0; // Natural yield occurred
+          } else if (sentSinceYield > 2 * 1024 * 1024) {
+            // Yield the main thread every 2MB pushed to prevent UI freezing/CPU locking
+            await new Promise(r => setTimeout(r, 0));
+            sentSinceYield = 0;
           }
         }
 
