@@ -685,6 +685,8 @@ export function useFileReceiver() {
   const [paused, setPaused] = useState(false);
   const [bytesReceived, setBytesReceived] = useState(0);
   const [bytesTotal, setBytesTotal] = useState(0);
+  const [chunksReceived, setChunksReceived] = useState(0);
+  const chunksReceivedRef = useRef(0);
 
   const peerRef = useRef(null);
   const connRef = useRef(null);
@@ -715,7 +717,7 @@ export function useFileReceiver() {
   // UI batching
   const rafRef = useRef(null);
   const [etc, setEtc] = useState('');
-  const pendingUIRef = useRef({ progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null, etc: null });
+  const pendingUIRef = useRef({ progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null, etc: null, chunksReceived: null });
 
   const isTransferring = status === 'receiving' || status === 'connected';
   useBeforeUnload(isTransferring);
@@ -731,11 +733,12 @@ export function useFileReceiver() {
     if (p.bytesReceived !== null) setBytesReceived(p.bytesReceived);
     if (p.bytesTotal !== null) setBytesTotal(p.bytesTotal);
     if (p.etc !== null) setEtc(p.etc);
-    pendingUIRef.current = { progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null, etc: null };
+    if (p.chunksReceived !== null) setChunksReceived(p.chunksReceived);
+    pendingUIRef.current = { progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null, etc: null, chunksReceived: null };
     rafRef.current = null;
   }, []);
 
-  const scheduleUI = useCallback((pct, spd, etaStr, spdLabel, received, total, etcStr) => {
+  const scheduleUI = useCallback((pct, spd, etaStr, spdLabel, received, total, etcStr, chunks) => {
     pendingUIRef.current.progress = pct;
     if (spd !== undefined) pendingUIRef.current.speed = spd;
     if (etaStr !== undefined) pendingUIRef.current.eta = etaStr;
@@ -743,6 +746,7 @@ export function useFileReceiver() {
     if (received !== undefined) pendingUIRef.current.bytesReceived = received;
     if (total !== undefined) pendingUIRef.current.bytesTotal = total;
     if (etcStr !== undefined) pendingUIRef.current.etc = etcStr;
+    if (chunks !== undefined) pendingUIRef.current.chunksReceived = chunks;
     if (!rafRef.current) rafRef.current = requestAnimationFrame(flushUI);
   }, [flushUI]);
 
@@ -792,7 +796,7 @@ export function useFileReceiver() {
 
     const pct = total > 0 ? (received >= total ? 100 : Math.min(99, Math.round((received / total) * 100))) : 0;
     const spdLabel = getSpeedLabel(spd);
-    scheduleUI(pct, spd, etaStr, spdLabel, received, total, etcStr);
+    scheduleUI(pct, spd, etaStr, spdLabel, received, total, etcStr, chunksReceivedRef.current);
 
     try {
       dc.send(JSON.stringify({
@@ -819,6 +823,7 @@ export function useFileReceiver() {
     grandReceivedRef.current = 0;
     grandTotalRef.current = 0;
     speedSamplesRef.current = [];
+    chunksReceivedRef.current = 0;
   }, []);
 
   // ---- PROCESS FILE CHUNK (hot path) ----
@@ -839,6 +844,7 @@ export function useFileReceiver() {
     }
 
     grandReceivedRef.current += data.byteLength;
+    chunksReceivedRef.current += 1;
 
     // On FIRST data chunk, send an immediate ACK so sender UI doesn't show 0 B
     if (firstDataRef.current) {
@@ -1064,7 +1070,7 @@ export function useFileReceiver() {
     setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
     setTransferStats(null); setPeerDevice(null); setNetworkMode(null); setActiveChunkSize(0);
     setSpeedLabel(getSpeedLabel(0)); setRemotePaused(false); setPaused(false);
-    setBytesReceived(0); setBytesTotal(0);
+    setBytesReceived(0); setBytesTotal(0); setChunksReceived(0);
   }, [stopAckTimer, freeBuffers]);
 
   useEffect(() => cleanup, [cleanup]);
@@ -1074,9 +1080,9 @@ export function useFileReceiver() {
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, networkMode, activeChunkSize,
     speedLabel, remotePaused, paused, togglePause,
-    bytesReceived, bytesTotal,
+    bytesReceived, bytesTotal, chunksReceived,
     connect, cleanup, formatBytes
   };
 }
 
-export { formatBytes, getDeviceName, NETWORK_MODES, CHUNK_TIERS, getSpeedLabel };
+export { formatBytes, formatTime, getDeviceName, NETWORK_MODES, CHUNK_TIERS, getSpeedLabel };

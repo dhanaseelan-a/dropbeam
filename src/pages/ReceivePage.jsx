@@ -1,14 +1,14 @@
 import { useState, useEffect } from 'react';
-import { useFileReceiver, formatBytes, NETWORK_MODES, getSpeedLabel } from '../hooks/useFileTransfer';
+import { useFileReceiver, formatBytes, formatTime, NETWORK_MODES, getSpeedLabel } from '../hooks/useFileTransfer';
 import { getFileIcon } from '../components/FilePreview';
 
 function ReceivePage({ onTransferStateChange }) {
   const {
-    status, progress, speed, speedRaw, eta, error,
+    status, progress, speed, speedRaw, eta, etc, error,
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, activeChunkSize,
     networkMode, speedLabel, remotePaused, paused, togglePause,
-    bytesReceived, bytesTotal,
+    bytesReceived, bytesTotal, chunksReceived,
     connect, cleanup
   } = useFileReceiver();
   const [inputCode, setInputCode] = useState('');
@@ -41,6 +41,8 @@ function ReceivePage({ onTransferStateChange }) {
   const offset = circ - (progress / 100) * circ;
   const net = networkMode ? NETWORK_MODES[networkMode] : null;
   const displaySpeedLabel = speedLabel || getSpeedLabel(0);
+  const displayChunkSize = activeChunkSize ? formatBytes(activeChunkSize) : '64 KB';
+  const totalChunks = activeChunkSize > 0 && bytesTotal > 0 ? Math.ceil(bytesTotal / activeChunkSize) : 0;
 
   return (
     <div className="fade-in">
@@ -115,6 +117,14 @@ function ReceivePage({ onTransferStateChange }) {
                 </div>
               </div>
 
+              {/* Linear progress bar */}
+              <div className="linear-progress-wrap">
+                <div className="linear-progress-bar">
+                  <div className="linear-progress-fill" style={{ width: `${progress}%` }}></div>
+                </div>
+                <span className="linear-progress-pct">{progress}%</span>
+              </div>
+
               {/* Speed label indicator */}
               {displaySpeedLabel && displaySpeedLabel.tier !== 'waiting' && (
                 <div className="speed-chip-center" style={{ '--speed-color': displaySpeedLabel.color }}>
@@ -123,10 +133,32 @@ function ReceivePage({ onTransferStateChange }) {
                 </div>
               )}
 
-              <div className="transfer-details">
-                {fileList.length > 1 && <div className="file-counter">File {currentFileIndex + 1} of {fileList.length}</div>}
-                <div className="chunk-counter">{formatBytes(bytesReceived)} / {formatBytes(bytesTotal)}</div>
-                <div className="chunk-counter">⏱ {eta} remaining</div>
+              {/* Transfer detail grid */}
+              <div className="transfer-detail-grid">
+                <div className="detail-row">
+                  <span className="detail-label">Transferred</span>
+                  <span className="detail-value">{formatBytes(bytesReceived)} / {formatBytes(bytesTotal)}</span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">Chunk</span>
+                  <span className="detail-value">{displayChunkSize} × {chunksReceived}{totalChunks ? ` / ${totalChunks}` : ''}</span>
+                </div>
+                {fileList.length > 1 && (
+                  <div className="detail-row">
+                    <span className="detail-label">File</span>
+                    <span className="detail-value">{currentFileIndex + 1} of {fileList.length}</span>
+                  </div>
+                )}
+                <div className="detail-row">
+                  <span className="detail-label">Remaining</span>
+                  <span className="detail-value">{eta || '--:--'}</span>
+                </div>
+                {etc && (
+                  <div className="detail-row">
+                    <span className="detail-label">Est. Done</span>
+                    <span className="detail-value">{etc}</span>
+                  </div>
+                )}
               </div>
 
               {/* Controls: Pause + Cancel */}

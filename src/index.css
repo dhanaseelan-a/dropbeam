@@ -425,6 +425,54 @@ body::before {
   padding: 0.5rem; max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all;
 }
 
+/* ===== Linear Progress Bar ===== */
+.linear-progress-wrap {
+  display: flex; align-items: center; gap: 0.6rem;
+  width: 100%; max-width: 340px; margin: 0 auto;
+}
+.linear-progress-wrap.compact {
+  max-width: 100%; margin: 0.4rem 0 0.2rem;
+}
+.linear-progress-bar {
+  flex: 1; height: 6px; background: var(--bg-secondary);
+  border-radius: 100px; overflow: hidden; position: relative;
+  border: 1px solid var(--border-color);
+}
+.linear-progress-fill {
+  height: 100%; border-radius: 100px;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa, #818cf8);
+  background-size: 200% 100%;
+  animation: progress-shimmer 2s ease-in-out infinite;
+  transition: width 300ms ease;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.4);
+}
+@keyframes progress-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.linear-progress-pct {
+  font-size: 0.65rem; font-weight: 700; color: var(--text-muted);
+  min-width: 2.5rem; text-align: right; flex-shrink: 0;
+}
+
+/* ===== Transfer Detail Grid ===== */
+.transfer-detail-grid {
+  display: grid; grid-template-columns: auto 1fr;
+  gap: 0.2rem 0.75rem; margin-top: 0.35rem;
+  align-items: baseline;
+}
+.detail-row {
+  display: contents;
+}
+.detail-label {
+  font-size: 0.65rem; color: var(--text-muted); font-weight: 500;
+  white-space: nowrap; text-align: right;
+}
+.detail-value {
+  font-size: 0.65rem; color: var(--text-secondary); font-weight: 600;
+  white-space: nowrap; font-family: 'Inter', monospace;
+}
+
 /* ===== Animations ===== */
 .fade-in { animation: fadeIn 0.3s ease forwards; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }

@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useDropzone } from 'react-dropzone';
 import JSZip from 'jszip';
 import { QRCodeSVG } from 'qrcode.react';
-import { useFileSender, formatBytes, NETWORK_MODES, getSpeedLabel, formatTime } from '../hooks/useFileTransfer';
+import { useFileSender, formatBytes, formatTime, NETWORK_MODES, getSpeedLabel } from '../hooks/useFileTransfer';
 import { FilePreview, FileThumbnail, getFileIcon } from '../components/FilePreview';
 
 function SendPage({ onTransferStateChange }) {
@@ -300,6 +300,13 @@ function SendPage({ onTransferStateChange }) {
                                   {displaySpeedLabel.label}
                                 </span>
                               )}
+                            </div>
+                            {/* Linear progress bar */}
+                            <div className="linear-progress-wrap compact">
+                              <div className="linear-progress-bar">
+                                <div className="linear-progress-fill" style={{ width: `${displayProgress}%` }}></div>
+                              </div>
+                              <span className="linear-progress-pct">{displayProgress}%</span>
                             </div>
                             <div className="transfer-detail-grid">
                               <div className="detail-row">
