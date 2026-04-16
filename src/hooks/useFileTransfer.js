@@ -2,11 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 16 * 1024;        // 16KB — Absolute industry standard to completely stop 0b STALLS
-const MAX_CHUNK  = 16 * 1024;        // 16KB
-const BUF_HI     = 2 * 1024 * 1024;  // 2MB — Max safe buffer limit without freezing browser memory
-const BUF_LO     = 512 * 1024;       // 512KB — Low watermark
-const READ_AHEAD = 128;              // Run 128 loops at a time to retain disk speed
+const CHUNK_SIZE = 64 * 1024;        // 64KB — Max size that reliably prevents 0b crashes
+const MAX_CHUNK  = 64 * 1024;        // 64KB
+const BUF_HI     = 8 * 1024 * 1024;  // 8MB — Extreme buffer for massive internet BDP (5MB/s+)
+const BUF_LO     = 2 * 1024 * 1024;  // 2MB — Low watermark
+const READ_AHEAD = 128;              // Run 128 loops (8MB batches)
 const ACK_INTERVAL = 400;            // Receiver ACK interval (ms)
 const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
 
@@ -24,9 +24,8 @@ const CHUNK_TIERS = {
 };
 
 // ===== ADAPTIVE CHUNK SIZING REMOVED =====
-// Always use small 16KB chunks to prevent Chromium WebRTC SCTP stack from crashing
 function getAdaptiveChunk() {
-  return CHUNK_SIZE; // Always 16KB
+  return CHUNK_SIZE; // Always 64KB
 }
 
 // ===== SPEED LABEL =====
@@ -367,7 +366,6 @@ export function useFileSender() {
         // Only: send, increment counters, backpressure check
         // NO speed tracking, NO formatting, NO object creation
         let pos = 0;
-        let sentSinceYield = 0;
         while (pos < bigView.length) {
           if (destroyedRef.current || conn._cancelled) break;
           if (!dc || dc.readyState !== 'open') break;
@@ -397,16 +395,9 @@ export function useFileSender() {
           globalBytesSent += chunk.byteLength;
           chunksSent++;
           
-          sentSinceYield += chunk.byteLength;
-
           // Backpressure — only wait when buffer exceeds HIGH watermark
           if (dc.bufferedAmount > BUF_HI) {
             await waitForDrain(dc);
-            sentSinceYield = 0; // Natural yield occurred
-          } else if (sentSinceYield > 2 * 1024 * 1024) {
-            // Yield the main thread every 2MB pushed to prevent UI freezing/CPU locking
-            await new Promise(r => setTimeout(r, 0));
-            sentSinceYield = 0;
           }
         }
 
