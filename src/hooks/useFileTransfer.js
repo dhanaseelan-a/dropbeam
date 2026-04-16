@@ -3,9 +3,9 @@ import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
 const CHUNK_SIZE = 256 * 1024;       // 256KB per dc.send() call
-const BUF_HI     = 1 * 1024 * 1024;  // 1MB — conservative to avoid send-queue-full
-const BUF_LO     = 256 * 1024;       // Resume sending when buffer drains to 256KB
-const READ_AHEAD = 16;               // Read 16 chunks (4MB) from disk at a time
+const BUF_HI     = 4 * 1024 * 1024;  // 4MB — more pipeline room for speed
+const BUF_LO     = 512 * 1024;       // Resume sending when buffer drains to 512KB
+const READ_AHEAD = 32;               // Read 32 chunks (8MB) from disk at a time
 const ACK_INTERVAL = 200;            // Receiver ACK interval (ms)
 const UI_INTERVAL  = 150;            // Sender UI throttle (ms)
 
@@ -19,6 +19,18 @@ const NETWORK_MODES = {
 const CHUNK_TIERS = {
   fast: { size: CHUNK_SIZE, label: 'Fast', bufHi: BUF_HI, ahead: READ_AHEAD },
 };
+
+// ===== SPEED LABEL =====
+function getSpeedLabel(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return { label: '⏳ Waiting', color: '#71717a', tier: 'waiting' };
+  const kbps = bytesPerSec / 1024;
+  const mbps = kbps / 1024;
+  if (kbps < 100)    return { label: `🐌 Very Slow`, color: '#ef4444', tier: 'very-slow', detail: `${kbps.toFixed(0)} KB/s` };
+  if (kbps < 500)    return { label: `🐢 Slow`,      color: '#f59e0b', tier: 'slow',      detail: `${kbps.toFixed(0)} KB/s` };
+  if (mbps < 2)      return { label: `⚡ Normal`,     color: '#3b82f6', tier: 'normal',    detail: `${mbps.toFixed(1)} MB/s` };
+  if (mbps < 10)     return { label: `🚀 Fast`,       color: '#22c55e', tier: 'fast',      detail: `${mbps.toFixed(1)} MB/s` };
+  return               { label: `⚡⚡ Very Fast`,     color: '#a855f7', tier: 'very-fast', detail: `${mbps.toFixed(1)} MB/s` };
+}
 
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -193,11 +205,32 @@ export function useFileSender() {
     setReceivers(prev => prev.map(r => r.id === id ? { ...r, ...updates } : r));
   }, []);
 
+  // ---- TOGGLE PAUSE WITH SYNC ----
+  const togglePause = useCallback(() => {
+    setPaused(p => {
+      const newPaused = !p;
+      // Send pause/resume to all active receivers
+      receiversRef.current.forEach(r => {
+        try {
+          const dc = getDC(r.conn);
+          if (dc && dc.readyState === 'open') {
+            dcSendJSON(dc, { type: newPaused ? 'pause' : 'resume' });
+          }
+        } catch (e) {}
+      });
+      return newPaused;
+    });
+  }, []);
+
   // ---- TRANSFER ENGINE ----
   const transferToReceiver = useCallback(async (receiverId, conn, filesToSend) => {
     let pendingUpdate = null;
     let updateTimer = null;
     let lastUpdateTime = 0;
+
+    // Sender-local speed tracking
+    const senderSpeedSamples = [];
+    let senderLocalSpeed = 0;
 
     const throttledUpdate = (upd) => {
       pendingUpdate = pendingUpdate ? { ...pendingUpdate, ...upd } : upd;
@@ -244,11 +277,23 @@ export function useFileSender() {
           const msg = JSON.parse(event.data);
           if (msg.type === 'ack') {
             if (msg.received != null) receiverBytes = Math.max(receiverBytes, msg.received);
-            throttledUpdate({ progress: msg.progress ?? 0, speed: msg.speed || 0, eta: msg.eta || '' });
+            // Update with receiver-reported progress, but keep sender-local speed if receiver hasn't reported yet
+            const updObj = { progress: msg.progress ?? 0, eta: msg.eta || '' };
+            if (msg.speed > 0) {
+              updObj.speed = msg.speed;
+              updObj.speedLabel = getSpeedLabel(msg.speed);
+            }
+            throttledUpdate(updObj);
           }
           if (msg.type === 'cancel') {
             conn._cancelled = true;
-            updateReceiver(receiverId, { status: 'disconnected', error: 'Cancelled by receiver' });
+            updateReceiver(receiverId, { status: 'cancelled', error: 'Cancelled by receiver' });
+          }
+          if (msg.type === 'pause') {
+            updateReceiver(receiverId, { remotePaused: true });
+          }
+          if (msg.type === 'resume') {
+            updateReceiver(receiverId, { remotePaused: false });
           }
           if (msg.type === 'device-info') {
             updateReceiver(receiverId, { device: msg.device || '' });
@@ -257,7 +302,7 @@ export function useFileSender() {
       }
     };
 
-    updateReceiver(receiverId, { status: 'transferring', progress: 0, speed: 0, eta: '', activeChunkSize: CHUNK_SIZE });
+    updateReceiver(receiverId, { status: 'transferring', progress: 0, speed: 0, eta: '', activeChunkSize: CHUNK_SIZE, speedLabel: getSpeedLabel(0) });
 
     dcSendJSON(dc, {
       type: 'file-list',
@@ -324,15 +369,60 @@ export function useFileSender() {
 
           offset += buf.byteLength;
           globalBytesSent += buf.byteLength;
+
+          // === FIX #1: Sender-local speed + immediate progress ===
+          const now = Date.now();
+          senderSpeedSamples.push({ time: now, bytes: globalBytesSent });
+          // Keep only last 3 seconds of samples
+          while (senderSpeedSamples.length > 2 && now - senderSpeedSamples[0].time > 3000) {
+            senderSpeedSamples.shift();
+          }
+          if (senderSpeedSamples.length >= 2) {
+            const oldest = senderSpeedSamples[0];
+            const elapsed = (now - oldest.time) / 1000;
+            if (elapsed > 0) {
+              senderLocalSpeed = (globalBytesSent - oldest.bytes) / elapsed;
+            }
+          }
+
+          const senderPct = grandTotal > 0 ? Math.min(99, Math.round((globalBytesSent / grandTotal) * 100)) : 0;
+          const senderEta = senderLocalSpeed > 0 ? formatTime((grandTotal - globalBytesSent) / senderLocalSpeed) : '--:--';
+
+          throttledUpdate({
+            bytesSent: globalBytesSent,
+            bytesTotal: grandTotal,
+            senderProgress: senderPct,
+            senderSpeed: senderLocalSpeed,
+            senderEta: senderEta,
+            senderSpeedLabel: getSpeedLabel(senderLocalSpeed),
+          });
         }
 
-        throttledUpdate({ bytesSent: globalBytesSent, bytesTotal: grandTotal });
+        // Check cancel after each batch
+        if (conn._cancelled) break;
       }
+
+      // Check cancel before sending file-end
+      if (destroyedRef.current || conn._cancelled) break;
 
       dcSendJSON(dc, { type: 'file-end', index: fi });
     }
 
-    // Wait for receiver confirmation
+    // === FIX #2: Check cancel BEFORE marking done ===
+    if (destroyedRef.current || conn._cancelled) {
+      flushUpdate();
+      if (dc) dc.onmessage = null;
+      // Don't overwrite 'cancelled' status if already set
+      setReceivers(prev => prev.map(r => {
+        if (r.id === receiverId && r.status !== 'cancelled') {
+          return { ...r, status: 'disconnected' };
+        }
+        return r;
+      }));
+      return;
+    }
+
+    // Wait for receiver confirmation — but also check cancel during wait
     await new Promise((resolve) => {
       if (receiverBytes >= grandTotal) return resolve();
       const onMsg = (event) => {
@@ -342,13 +432,31 @@ export function useFileSender() {
             if (msg.type === 'ack' && msg.received >= grandTotal) {
               dc.removeEventListener('message', onMsg);
               clearTimeout(sid);
+              clearInterval(cancelCheck);
+              resolve();
+            }
+            // Also check if cancel arrives during confirmation wait
+            if (msg.type === 'cancel') {
+              conn._cancelled = true;
+              dc.removeEventListener('message', onMsg);
+              clearTimeout(sid);
+              clearInterval(cancelCheck);
               resolve();
             }
           } catch (e) {}
         }
       };
       dc.addEventListener('message', onMsg);
-      const sid = setTimeout(() => { dc.removeEventListener('message', onMsg); resolve(); }, 15000);
+      // Check cancel periodically during wait
+      const cancelCheck = setInterval(() => {
+        if (conn._cancelled || destroyedRef.current) {
+          dc.removeEventListener('message', onMsg);
+          clearTimeout(sid);
+          clearInterval(cancelCheck);
+          resolve();
+        }
+      }, 100);
+      const sid = setTimeout(() => { dc.removeEventListener('message', onMsg); clearInterval(cancelCheck); resolve(); }, 15000);
     });
 
     flushUpdate();
@@ -356,8 +464,14 @@ export function useFileSender() {
     // Clean up dc.onmessage to release closure references
     if (dc) dc.onmessage = null;
 
+    // Check cancel one final time after confirmation
     if (destroyedRef.current || conn._cancelled) {
-      updateReceiver(receiverId, { status: 'disconnected' });
+      setReceivers(prev => prev.map(r => {
+        if (r.id === receiverId && r.status !== 'cancelled') {
+          return { ...r, status: 'disconnected' };
+        }
+        return r;
+      }));
       return;
     }
 
@@ -367,7 +481,8 @@ export function useFileSender() {
     updateReceiver(receiverId, {
       status: 'done', progress: 100,
       avgSpeed: grandTotal / totalTime,
-      totalTime, totalBytes: grandTotal
+      totalTime, totalBytes: grandTotal,
+      speedLabel: getSpeedLabel(grandTotal / totalTime),
     });
     playDone();
   }, [updateReceiver]);
@@ -404,6 +519,9 @@ export function useFileSender() {
           id: receiverId, conn, device: '', status: 'connecting',
           progress: 0, speed: 0, eta: '', networkMode: null,
           currentFile: 0, avgSpeed: 0, totalTime: 0, totalBytes: 0,
+          speedLabel: getSpeedLabel(0), remotePaused: false,
+          senderProgress: 0, senderSpeed: 0, senderEta: '',
+          senderSpeedLabel: getSpeedLabel(0),
         };
         setReceivers(prev => [...prev, newReceiver]);
         receiversRef.current.push(newReceiver);
@@ -416,7 +534,9 @@ export function useFileSender() {
               try {
                 const msg = JSON.parse(event.data);
                 if (msg.type === 'device-info') updateReceiver(receiverId, { device: msg.device || '' });
-                if (msg.type === 'cancel') { conn._cancelled = true; updateReceiver(receiverId, { status: 'disconnected', error: 'Cancelled' }); }
+                if (msg.type === 'cancel') { conn._cancelled = true; updateReceiver(receiverId, { status: 'cancelled', error: 'Cancelled by receiver' }); }
+                if (msg.type === 'pause') { updateReceiver(receiverId, { remotePaused: true }); }
+                if (msg.type === 'resume') { updateReceiver(receiverId, { remotePaused: false }); }
               } catch (e) {}
             }
           };
@@ -438,7 +558,7 @@ export function useFileSender() {
       conn.on('close', () => {
         if (destroyedRef.current) return;
         setReceivers(prev => prev.map(r => {
-          if (r.id === receiverId && r.status !== 'done') return { ...r, status: 'disconnected' };
+          if (r.id === receiverId && r.status !== 'done' && r.status !== 'cancelled') return { ...r, status: 'disconnected' };
           return r;
         }));
       });
@@ -453,8 +573,6 @@ export function useFileSender() {
 
     peerRef.current = peer;
   }, [transferToReceiver, updateReceiver]);
-
-  const togglePause = useCallback(() => setPaused(p => !p), []);
 
   const cleanup = useCallback(() => {
     destroyedRef.current = true;
@@ -476,7 +594,7 @@ export function useFileSender() {
 
   useEffect(() => cleanup, [cleanup]);
 
-  const allDone = receivers.length > 0 && receivers.every(r => r.status === 'done' || r.status === 'error' || r.status === 'disconnected');
+  const allDone = receivers.length > 0 && receivers.every(r => r.status === 'done' || r.status === 'error' || r.status === 'disconnected' || r.status === 'cancelled');
   useEffect(() => {
     if (allDone && statusRef.current === 'transferring') {
       setStatus('done');
@@ -507,6 +625,9 @@ export function useFileReceiver() {
   const [peerDevice, setPeerDevice] = useState('');
   const [networkMode, setNetworkMode] = useState(null);
   const [activeChunkSize, setActiveChunkSize] = useState(0);
+  const [speedLabel, setSpeedLabel] = useState(getSpeedLabel(0));
+  const [remotePaused, setRemotePaused] = useState(false);
+  const [paused, setPaused] = useState(false);
 
   const peerRef = useRef(null);
   const connRef = useRef(null);
@@ -523,6 +644,7 @@ export function useFileReceiver() {
   const destroyedRef = useRef(false);
   const statusRef = useRef('idle');
   const fileListRef = useRef([]);
+  const pausedRef = useRef(false);
 
   // ACK timer
   const ackTimerRef = useRef(null);
@@ -535,27 +657,42 @@ export function useFileReceiver() {
 
   // UI batching
   const rafRef = useRef(null);
-  const pendingUIRef = useRef({ progress: null, speed: null, eta: null });
+  const pendingUIRef = useRef({ progress: null, speed: null, eta: null, speedLabel: null });
 
   const isTransferring = status === 'receiving' || status === 'connected';
   useBeforeUnload(isTransferring);
   useEffect(() => { statusRef.current = status; }, [status]);
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
 
   const flushUI = useCallback(() => {
     const p = pendingUIRef.current;
     if (p.progress !== null) setProgress(p.progress);
     if (p.speed !== null) setSpeed(p.speed);
     if (p.eta !== null) setEta(p.eta);
-    pendingUIRef.current = { progress: null, speed: null, eta: null };
+    if (p.speedLabel !== null) setSpeedLabel(p.speedLabel);
+    pendingUIRef.current = { progress: null, speed: null, eta: null, speedLabel: null };
     rafRef.current = null;
   }, []);
 
-  const scheduleUI = useCallback((pct, spd, etaStr) => {
+  const scheduleUI = useCallback((pct, spd, etaStr, spdLabel) => {
     pendingUIRef.current.progress = pct;
     if (spd !== undefined) pendingUIRef.current.speed = spd;
     if (etaStr !== undefined) pendingUIRef.current.eta = etaStr;
+    if (spdLabel !== undefined) pendingUIRef.current.speedLabel = spdLabel;
     if (!rafRef.current) rafRef.current = requestAnimationFrame(flushUI);
   }, [flushUI]);
+
+  // ---- Toggle pause with sync ----
+  const togglePause = useCallback(() => {
+    setPaused(p => {
+      const newPaused = !p;
+      const dc = dcRef.current;
+      if (dc && dc.readyState === 'open') {
+        dcSendJSON(dc, { type: newPaused ? 'pause' : 'resume' });
+      }
+      return newPaused;
+    });
+  }, []);
 
   // ---- COMPUTE SPEED + SEND ACK ----
   const sendAckNow = useCallback(() => {
@@ -584,7 +721,8 @@ export function useFileReceiver() {
     lastEtaRef.current = etaStr;
 
     const pct = total > 0 ? (received >= total ? 100 : Math.min(99, Math.round((received / total) * 100))) : 0;
-    scheduleUI(pct, spd, etaStr);
+    const spdLabel = getSpeedLabel(spd);
+    scheduleUI(pct, spd, etaStr, spdLabel);
 
     try {
       dc.send(JSON.stringify({
@@ -707,13 +845,17 @@ export function useFileReceiver() {
         sendAckNow();
         stopAckTimer();
         const tt = (Date.now() - startTimeRef.current) / 1000;
+        const avgSpd = grandReceivedRef.current / tt;
         setTransferStats({
           totalBytes: grandReceivedRef.current, totalTime: tt,
-          avgSpeed: grandReceivedRef.current / tt,
-          fileCount: fileListRef.current.length || 1
+          avgSpeed: avgSpd,
+          fileCount: fileListRef.current.length || 1,
+          speedLabel: getSpeedLabel(avgSpd),
         });
         setProgress(100);
         setStatus('done');
+        setRemotePaused(false);
+        setPaused(false);
         // Free all buffers on completion
         freeBuffers();
         playDone();
@@ -723,8 +865,18 @@ export function useFileReceiver() {
       case 'cancel':
         stopAckTimer();
         freeBuffers();
+        setRemotePaused(false);
+        setPaused(false);
         setError('Transfer cancelled by sender');
         setStatus('error');
+        break;
+
+      case 'pause':
+        setRemotePaused(true);
+        break;
+
+      case 'resume':
+        setRemotePaused(false);
         break;
 
       case 'rejected':
@@ -748,6 +900,8 @@ export function useFileReceiver() {
     setStatus('connecting');
     setError('');
     setNetworkMode(null);
+    setRemotePaused(false);
+    setPaused(false);
 
     const peer = new Peer({
       config: { iceServers: ICE, sdpSemantics: 'unified-plan' },
@@ -797,6 +951,8 @@ export function useFileReceiver() {
         if (!destroyedRef.current && statusRef.current !== 'done') {
           stopAckTimer();
           freeBuffers();
+          setRemotePaused(false);
+          setPaused(false);
           setError('Connection closed'); setStatus('error');
         }
       });
@@ -804,6 +960,8 @@ export function useFileReceiver() {
         if (!destroyedRef.current) {
           stopAckTimer();
           freeBuffers();
+          setRemotePaused(false);
+          setPaused(false);
           setError(e.message); setStatus('error');
         }
       });
@@ -833,16 +991,18 @@ export function useFileReceiver() {
     setStatus('idle'); setError(''); setProgress(0); setSpeed(0); setEta('');
     setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
     setTransferStats(null); setPeerDevice(null); setNetworkMode(null); setActiveChunkSize(0);
+    setSpeedLabel(getSpeedLabel(0)); setRemotePaused(false); setPaused(false);
   }, [stopAckTimer, freeBuffers]);
 
   useEffect(() => cleanup, [cleanup]);
 
   return {
-    status, progress, speed: formatBytes(speed) + '/s', eta, error,
+    status, progress, speed: formatBytes(speed) + '/s', speedRaw: speed, eta, error,
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, networkMode, activeChunkSize,
+    speedLabel, remotePaused, paused, togglePause,
     connect, cleanup, formatBytes
   };
 }
 
-export { formatBytes, getDeviceName, NETWORK_MODES, CHUNK_TIERS };
+export { formatBytes, getDeviceName, NETWORK_MODES, CHUNK_TIERS, getSpeedLabel };

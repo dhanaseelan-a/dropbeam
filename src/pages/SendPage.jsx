@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useDropzone } from 'react-dropzone';
 import JSZip from 'jszip';
 import { QRCodeSVG } from 'qrcode.react';
-import { useFileSender, formatBytes, NETWORK_MODES } from '../hooks/useFileTransfer';
+import { useFileSender, formatBytes, NETWORK_MODES, getSpeedLabel } from '../hooks/useFileTransfer';
 import { FilePreview, FileThumbnail, getFileIcon } from '../components/FilePreview';
 
 function SendPage({ onTransferStateChange }) {
@@ -116,7 +116,20 @@ function SendPage({ onTransferStateChange }) {
     const next = files.filter((_, idx) => idx !== i);
     if (!next.length) { cleanup(); setFiles([]); } else setFiles(next);
   };
-  const handleReset = () => { cleanup(); setFiles([]); setPreviewFile(null); };
+
+  // === FIX #5: "Send more files" properly resets everything ===
+  const handleSendMore = () => {
+    cleanup();
+    setFiles([]);
+    setPreviewFile(null);
+  };
+
+  const handleReset = () => {
+    cleanup();
+    setFiles([]);
+    setPreviewFile(null);
+  };
+
   const handleCancel = () => {
     if (window.confirm('⚠️ Cancel transfer?\n\nThis will disconnect all receivers and stop the transfer immediately.')) {
       handleReset();
@@ -231,7 +244,15 @@ function SendPage({ onTransferStateChange }) {
               {receivers.length > 1 && <div className="receivers-title">{receivers.length} Devices</div>}
               {receivers.map((r) => {
                 const net = r.networkMode ? NETWORK_MODES[r.networkMode] : null;
-                const offset = circ - (r.progress / 100) * circ;
+                // Use sender-local progress for immediate feedback, fall back to ACK progress
+                const displayProgress = r.senderProgress > r.progress ? r.senderProgress : r.progress;
+                const offset = circ - (displayProgress / 100) * circ;
+                // Use sender-local speed if receiver hasn't reported yet
+                const displaySpeed = r.speed > 0 ? r.speed : r.senderSpeed;
+                const displayEta = r.eta && r.eta !== '--:--' ? r.eta : r.senderEta;
+                const displaySpeedLabel = displaySpeed > 0
+                  ? (r.speed > 0 ? r.speedLabel : r.senderSpeedLabel)
+                  : getSpeedLabel(0);
 
                 return (
                   <div className="receiver-card" key={r.id}>
@@ -239,6 +260,7 @@ function SendPage({ onTransferStateChange }) {
                       <span className="receiver-device">{r.device || 'Unknown device'}</span>
                       {net && <span className="network-chip-sm" style={{ '--net-color': net.color }}>{net.icon}</span>}
                       {r.status === 'done' && <span className="file-done-badge">✓</span>}
+                      {r.status === 'cancelled' && <span className="file-cancel-badge">✕</span>}
                     </div>
 
                     {r.status === 'connecting' && (
@@ -246,22 +268,46 @@ function SendPage({ onTransferStateChange }) {
                     )}
 
                     {r.status === 'transferring' && (
-                      <div className="receiver-progress">
-                        <div className="mini-ring-wrap">
-                          <svg viewBox="0 0 120 120" className="mini-ring-svg">
-                            <circle cx="60" cy="60" r={radius} className="ring-track" />
-                            <circle cx="60" cy="60" r={radius} className="ring-fill" strokeDasharray={circ} strokeDashoffset={offset} transform="rotate(-90 60 60)" />
-                          </svg>
-                          <span className="mini-ring-pct">{r.progress}%</span>
-                        </div>
-                        <div className="receiver-info">
-                          <div className="receiver-speed">{formatBytes(r.speed)}/s</div>
-                          <div className="receiver-meta">
-                            {r.activeChunkSize > 0 && <span>{formatBytes(r.activeChunkSize)} chunks</span>}
-                            {r.eta && <span> · {r.eta}</span>}
+                      <>
+                        {/* Remote pause banner */}
+                        {r.remotePaused && (
+                          <div className="remote-pause-banner fade-in">⏸ Receiver paused</div>
+                        )}
+
+                        <div className="receiver-progress">
+                          <div className="mini-ring-wrap">
+                            <svg viewBox="0 0 120 120" className="mini-ring-svg">
+                              <circle cx="60" cy="60" r={radius} className="ring-track" />
+                              <circle cx="60" cy="60" r={radius} className="ring-fill" strokeDasharray={circ} strokeDashoffset={offset} transform="rotate(-90 60 60)" />
+                            </svg>
+                            <span className="mini-ring-pct">{displayProgress}%</span>
                           </div>
-                          <div className="receiver-chunks">{formatBytes(r.bytesSent)} / {formatBytes(r.bytesTotal)}</div>
+                          <div className="receiver-info">
+                            <div className="receiver-speed">{formatBytes(displaySpeed)}/s</div>
+                            {/* Speed label indicator */}
+                            {displaySpeedLabel && displaySpeedLabel.tier !== 'waiting' && (
+                              <div className="speed-indicator" style={{ '--speed-color': displaySpeedLabel.color }}>
+                                {displaySpeedLabel.label}
+                              </div>
+                            )}
+                            <div className="receiver-meta">
+                              {displayEta && <span>{displayEta} remaining</span>}
+                            </div>
+                            <div className="receiver-chunks">{formatBytes(r.bytesSent)} / {formatBytes(r.bytesTotal)}</div>
+                          </div>
                         </div>
+                      </>
+                    )}
+
+                    {r.status === 'cancelled' && (
+                      <div className="receiver-cancelled">
+                        <span>Cancelled by receiver</span>
+                      </div>
+                    )}
+
+                    {r.status === 'disconnected' && (
+                      <div className="receiver-cancelled">
+                        <span>Disconnected</span>
                       </div>
                     )}
 
@@ -281,7 +327,7 @@ function SendPage({ onTransferStateChange }) {
               <div className="complete-icon">✓</div>
               <div className="complete-title">All Transfers Complete</div>
               {expiryCountdown && <div className="expiry-badge">Code expires in {expiryCountdown}</div>}
-              <button className="btn btn-secondary" onClick={handleReset} style={{ marginTop: '1rem' }}>Send more files</button>
+              <button className="btn btn-secondary" onClick={handleSendMore} style={{ marginTop: '1rem' }}>Send more files</button>
             </div>
           )}
 
