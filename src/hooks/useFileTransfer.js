@@ -25,14 +25,14 @@ const CHUNK_TIERS = {
 
 // ===== ADAPTIVE CHUNK SIZING =====
 // Dynamically scales chunk size based on true network speed.
-// More aggressive ramp-up to reduce per-message SCTP overhead on internet connections.
+// CRITICAL: Only scales UP from CHUNK_SIZE. Never downgrades — smaller chunks
+// cause more per-message SCTP overhead which creates a speed death spiral.
 function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
-  if (kbps < 100) return 32 * 1024;      // <100 KB/s  → 32KB
-  if (kbps < 500) return 64 * 1024;      // <500 KB/s  → 64KB
-  if (kbps < 2000) return 128 * 1024;    // <2 MB/s    → 128KB
-  return MAX_CHUNK;                      // >=2 MB/s   → 256KB
+  if (kbps < 500) return CHUNK_SIZE;       // Keep 64KB — never downgrade below initial
+  if (kbps < 2000) return 128 * 1024;     // <2 MB/s   → 128KB
+  return MAX_CHUNK;                        // >=2 MB/s  → 256KB
 }
 
 // ===== SPEED LABEL =====
@@ -324,7 +324,7 @@ export function useFileSender() {
       // Speed and ETA are exclusively calculated by the Receiver's ACKs to avoid 0B glitches.
       const displayBytes = globalBytesSent;
       const pct = grandTotal > 0 ? Math.min(99, Math.round((displayBytes / grandTotal) * 100)) : 0;
-      const totalChunks = Math.ceil(grandTotal / currentChunkSize);
+      const totalChunks = Math.ceil(grandTotal / CHUNK_SIZE);
 
       // Adaptive Check -> use the 'currentSpeed' harvested from receiver ACKs!
       if (currentSpeed > 0) {
@@ -350,7 +350,7 @@ export function useFileSender() {
     updateReceiver(receiverId, {
       status: 'transferring', progress: 0, speed: 0, eta: '', etc: '',
       activeChunkSize: currentChunkSize, speedLabel: getSpeedLabel(0),
-      chunksSent: 0, totalChunks: Math.ceil(grandTotal / currentChunkSize),
+      chunksSent: 0, totalChunks: Math.ceil(grandTotal / CHUNK_SIZE),
     });
 
     dcSendJSON(dc, {
@@ -1079,4 +1079,4 @@ export function useFileReceiver() {
   };
 }
 
-export { formatBytes, formatTime, getDeviceName, NETWORK_MODES, CHUNK_TIERS, getSpeedLabel };
+export { formatBytes, formatTime, getDeviceName, NETWORK_MODES, CHUNK_TIERS, getSpeedLabel, CHUNK_SIZE };

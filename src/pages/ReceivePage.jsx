@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useFileReceiver, formatBytes, formatTime, NETWORK_MODES, getSpeedLabel } from '../hooks/useFileTransfer';
+import { useFileReceiver, formatBytes, formatTime, NETWORK_MODES, getSpeedLabel, CHUNK_SIZE } from '../hooks/useFileTransfer';
 import { getFileIcon } from '../components/FilePreview';
 
 function ReceivePage({ onTransferStateChange }) {
@@ -42,7 +42,7 @@ function ReceivePage({ onTransferStateChange }) {
   const net = networkMode ? NETWORK_MODES[networkMode] : null;
   const displaySpeedLabel = speedLabel || getSpeedLabel(0);
   const displayChunkSize = activeChunkSize ? formatBytes(activeChunkSize) : '64 KB';
-  const totalChunks = activeChunkSize > 0 && bytesTotal > 0 ? Math.ceil(bytesTotal / activeChunkSize) : 0;
+  const totalChunks = bytesTotal > 0 ? Math.ceil(bytesTotal / CHUNK_SIZE) : 0;
 
   return (
     <div className="fade-in">
