@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 64 * 1024;        // 64KB — safe WebRTC starting chunk
+const CHUNK_SIZE = 128 * 1024;       // 128KB — aggressive starting chunk for fast ramp-up
 const MAX_CHUNK  = 256 * 1024;       // 256KB — max safe SCTP message (Chrome/Safari limit)
 const BUF_HI     = 2 * 1024 * 1024;  // 2MB — HIGH watermark: pause sending when exceeded
 const BUF_LO     = 512 * 1024;       // 512KB — LOW watermark: resume after drain
@@ -30,8 +30,8 @@ function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
   if (kbps < 300) return 64 * 1024;      // <300 KB/s → 64KB chunks
-  if (kbps < 1024) return 128 * 1024;    // <1 MB/s  → 128KB chunks
-  return MAX_CHUNK;                       // ≥1 MB/s  → 256KB chunks
+  if (kbps < 1000) return 128 * 1024;    // <1 MB/s  → 128KB chunks
+  return MAX_CHUNK;                      // ≥1 MB/s  → 256KB chunks
 }
 
 // ===== SPEED LABEL =====
@@ -115,24 +115,8 @@ const ICE = [
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
-  // TURN — relay when direct P2P fails (symmetric NAT, strict firewall, mobile data)
-  // Without TURN, PeerJS falls back to its slow WebSocket relay (~300KB/s cap)
-  {
-    urls: [
-      'turn:openrelay.metered.ca:80',
-      'turn:openrelay.metered.ca:80?transport=tcp',
-      'turn:openrelay.metered.ca:443',
-      'turn:openrelay.metered.ca:443?transport=tcp',
-    ],
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  // TLS-secured TURN — works through strict firewalls that block non-443 ports
-  {
-    urls: 'turns:openrelay.metered.ca:443',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
+  { urls: 'stun:stun.services.mozilla.com' },
+  { urls: 'stun:stun.cloudflare.com:3478' }
 ];
 
 function getDC(conn) {
