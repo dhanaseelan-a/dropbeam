@@ -2,11 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 256 * 1024;       // 256KB — ABSOLUTE MAX PROTOCOL CHUNK SIZE
-const MAX_CHUNK  = 256 * 1024;       // 256KB
-const BUF_HI     = 8 * 1024 * 1024;  // 8MB — Extreme high watermark
-const BUF_LO     = 2 * 1024 * 1024;  // 2MB — Extreme low watermark
-const READ_AHEAD = 32;               // Read 32 chunks at a time
+const CHUNK_SIZE = 16 * 1024;        // 16KB — Absolute industry standard to completely stop 0b STALLS
+const MAX_CHUNK  = 16 * 1024;        // 16KB
+const BUF_HI     = 2 * 1024 * 1024;  // 2MB — Max safe buffer limit without freezing browser memory
+const BUF_LO     = 512 * 1024;       // 512KB — Low watermark
+const READ_AHEAD = 128;              // Run 128 loops at a time to retain disk speed
 const ACK_INTERVAL = 400;            // Receiver ACK interval (ms)
 const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
 
@@ -24,9 +24,9 @@ const CHUNK_TIERS = {
 };
 
 // ===== ADAPTIVE CHUNK SIZING REMOVED =====
-// User requested maximum flat chunk sizes without adapting downwards.
+// Always use small 16KB chunks to prevent Chromium WebRTC SCTP stack from crashing
 function getAdaptiveChunk() {
-  return CHUNK_SIZE; // Always 256KB
+  return CHUNK_SIZE; // Always 16KB
 }
 
 // ===== SPEED LABEL =====
