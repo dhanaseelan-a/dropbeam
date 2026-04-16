@@ -41,7 +41,7 @@ function ReceivePage({ onTransferStateChange }) {
   const offset = circ - (progress / 100) * circ;
   const net = networkMode ? NETWORK_MODES[networkMode] : null;
   const displaySpeedLabel = speedLabel || getSpeedLabel(0);
-  const displayChunkSize = activeChunkSize ? formatBytes(activeChunkSize) : '64 KB';
+  const displayChunkSize = activeChunkSize ? formatBytes(activeChunkSize) : '128 KB';
   const totalChunks = bytesTotal > 0 ? Math.ceil(bytesTotal / CHUNK_SIZE) : 0;
 
   return (

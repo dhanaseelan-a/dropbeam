@@ -2,12 +2,12 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 64 * 1024;         // 64KB — Larger initial chunk to reduce per-message SCTP overhead
+const CHUNK_SIZE = 128 * 1024;        // 128KB — Large initial chunk for maximum SCTP pipeline efficiency
 const MAX_CHUNK  = 256 * 1024;        // 256KB — Safe max for all browsers/SCTP implementations
-const BUF_HI     = 1 * 1024 * 1024;   // 1MB — High watermark (was 4MB — over-buffered on slow links)
-const BUF_LO     = 128 * 1024;        // 128KB — Low watermark (was 1MB — caused 18s stalls at 56KB/s)
-const READ_AHEAD = 16;                // Read 16 chunks at a time (was 64 — too large for slow connections)
-const ACK_INTERVAL = 200;             // Receiver ACK interval (ms) — faster speed feedback loop
+const BUF_HI     = 2 * 1024 * 1024;   // 2MB — High watermark: keeps SCTP congestion window well-fed
+const BUF_LO     = 256 * 1024;        // 256KB — Low watermark: resume quickly without buffer starvation
+const READ_AHEAD = 8;                 // Read 8 chunks at a time (128KB × 8 = 1MB batch)
+const ACK_INTERVAL = 200;             // Receiver ACK interval (ms)
 const UI_INTERVAL  = 200;             // Sender UI throttle (ms)
 
 const NETWORK_MODES = {
@@ -18,9 +18,9 @@ const NETWORK_MODES = {
 };
 
 const CHUNK_TIERS = {
-  slow:   { size: 64 * 1024,   label: 'Slow',   bufHi: 512 * 1024,       ahead: 8 },
-  normal: { size: 128 * 1024,  label: 'Normal', bufHi: 1 * 1024 * 1024,  ahead: 16 },
-  fast:   { size: 256 * 1024,  label: 'Fast',   bufHi: 1 * 1024 * 1024,  ahead: 16 },
+  slow:   { size: 128 * 1024,  label: 'Slow',   bufHi: 1 * 1024 * 1024,  ahead: 4 },
+  normal: { size: 128 * 1024,  label: 'Normal', bufHi: 2 * 1024 * 1024,  ahead: 8 },
+  fast:   { size: 256 * 1024,  label: 'Fast',   bufHi: 2 * 1024 * 1024,  ahead: 8 },
 };
 
 // ===== ADAPTIVE CHUNK SIZING =====
@@ -30,9 +30,8 @@ const CHUNK_TIERS = {
 function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
-  if (kbps < 500) return CHUNK_SIZE;       // Keep 64KB — never downgrade below initial
-  if (kbps < 2000) return 128 * 1024;     // <2 MB/s   → 128KB
-  return MAX_CHUNK;                        // >=2 MB/s  → 256KB
+  if (kbps < 2000) return CHUNK_SIZE;      // Keep 128KB — never downgrade below initial
+  return MAX_CHUNK;                        // >=2 MB/s → 256KB
 }
 
 // ===== SPEED LABEL =====
@@ -401,8 +400,8 @@ export function useFileSender() {
             dc.send(chunk);
           } catch (err) {
             // Buffer overflow OR WebRTC Message Too Large Exception
-            if (err.name === 'TypeError' || String(err).includes('too large') || currentChunkSize > 64 * 1024) {
-               // Browser rejected chunk — step down to reduce message size
+            if (err.name === 'TypeError' || String(err).includes('too large')) {
+               // Browser rejected message size — step down chunk permanently
                currentChunkSize = Math.max(16 * 1024, Math.floor(currentChunkSize / 2));
                lastSentChunkSize = currentChunkSize;
                dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });

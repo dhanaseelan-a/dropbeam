@@ -266,7 +266,7 @@ function SendPage({ onTransferStateChange }) {
                   ? (r.speed > 0 ? r.speedLabel : r.senderSpeedLabel)
                   : getSpeedLabel(0);
                 const displayEtc = r.etc && r.etc !== '' ? r.etc : (r.senderEtc || '');
-                const displayChunkSize = r.activeChunkSize ? formatBytes(r.activeChunkSize) : '64 KB';
+                const displayChunkSize = r.activeChunkSize ? formatBytes(r.activeChunkSize) : '128 KB';
 
                 return (
                   <div className="receiver-card" key={r.id}>
