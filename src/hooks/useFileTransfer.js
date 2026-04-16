@@ -2,11 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 128 * 1024;       // 128KB — aggressive starting chunk for fast ramp-up
-const MAX_CHUNK  = 256 * 1024;       // 256KB — max safe SCTP message (Chrome/Safari limit)
-const BUF_HI     = 2 * 1024 * 1024;  // 2MB — HIGH watermark: pause sending when exceeded
-const BUF_LO     = 512 * 1024;       // 512KB — LOW watermark: resume after drain
-const READ_AHEAD = 32;               // Read 32 chunks at a time — large disk batches
+const CHUNK_SIZE = 16 * 1024;        // 16KB — most reliable SCTP chunk size (prevents packet-loss stalls)
+const MAX_CHUNK  = 64 * 1024;        // 64KB — max safe SCTP message without heavy fragmentation
+const BUF_HI     = 256 * 1024;       // 256KB — HIGH watermark (prevents buffer bloat stalling)
+const BUF_LO     = 64 * 1024;        // 64KB — LOW watermark
+const READ_AHEAD = 64;               // Read 64 chunks at a time
 const ACK_INTERVAL = 400;            // Receiver ACK interval (ms)
 const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
 
@@ -29,9 +29,9 @@ const CHUNK_TIERS = {
 function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
-  if (kbps < 300) return 64 * 1024;      // <300 KB/s → 64KB chunks
-  if (kbps < 1000) return 128 * 1024;    // <1 MB/s  → 128KB chunks
-  return MAX_CHUNK;                      // ≥1 MB/s  → 256KB chunks
+  if (kbps < 300) return 16 * 1024;      // <300 KB/s → 16KB chunks
+  if (kbps < 1000) return 32 * 1024;     // <1 MB/s  → 32KB chunks
+  return MAX_CHUNK;                      // ≥1 MB/s  → 64KB chunks
 }
 
 // ===== SPEED LABEL =====
