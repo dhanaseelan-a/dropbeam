@@ -329,6 +329,9 @@ export function useFileSender() {
 
     let currentChunkSize = CHUNK_SIZE;
     let chunksSent = 0;
+    const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
+    const startTime = Date.now();
+    let globalBytesSent = 0;
     const totalChunks = Math.ceil(grandTotal / currentChunkSize);
 
     updateReceiver(receiverId, {
@@ -343,10 +346,6 @@ export function useFileSender() {
       device: getDeviceName(),
       chunkSize: CHUNK_SIZE
     });
-
-    const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
-    const startTime = Date.now();
-    let globalBytesSent = 0;
 
     for (let fi = 0; fi < filesToSend.length; fi++) {
       if (destroyedRef.current || conn._cancelled) break;
