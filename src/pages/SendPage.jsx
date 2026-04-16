@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useDropzone } from 'react-dropzone';
 import JSZip from 'jszip';
 import { QRCodeSVG } from 'qrcode.react';
-import { useFileSender, formatBytes, NETWORK_MODES, CHUNK_TIERS } from '../hooks/useFileTransfer';
+import { useFileSender, formatBytes, NETWORK_MODES } from '../hooks/useFileTransfer';
 import { FilePreview, FileThumbnail, getFileIcon } from '../components/FilePreview';
 
 function SendPage({ onTransferStateChange }) {
@@ -17,7 +17,7 @@ function SendPage({ onTransferStateChange }) {
   const [previewFile, setPreviewFile] = useState(null);
   const [isZipping, setIsZipping] = useState(false);
 
-  const isActive = status === 'transferring' || status === 'waiting' || receivers.some(r => r.status === 'transferring' || r.status === 'calibrating');
+  const isActive = status === 'transferring' || status === 'waiting' || receivers.some(r => r.status === 'transferring');
   useEffect(() => { onTransferStateChange?.(isActive); }, [isActive, onTransferStateChange]);
 
   useEffect(() => {
@@ -231,7 +231,6 @@ function SendPage({ onTransferStateChange }) {
               {receivers.length > 1 && <div className="receivers-title">{receivers.length} Devices</div>}
               {receivers.map((r) => {
                 const net = r.networkMode ? NETWORK_MODES[r.networkMode] : null;
-                const tier = r.chunkTier ? CHUNK_TIERS[r.chunkTier] : null;
                 const offset = circ - (r.progress / 100) * circ;
 
                 return (
@@ -242,8 +241,8 @@ function SendPage({ onTransferStateChange }) {
                       {r.status === 'done' && <span className="file-done-badge">✓</span>}
                     </div>
 
-                    {r.status === 'calibrating' && (
-                      <div className="receiver-status"><span className="status-dot" style={{ background: '#3b82f6' }}></span> Calibrating...</div>
+                    {r.status === 'connecting' && (
+                      <div className="receiver-status"><span className="status-dot" style={{ background: '#3b82f6' }}></span> Connecting...</div>
                     )}
 
                     {r.status === 'transferring' && (

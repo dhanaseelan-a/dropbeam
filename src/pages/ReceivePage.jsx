@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useFileReceiver, formatBytes, NETWORK_MODES, CHUNK_TIERS } from '../hooks/useFileTransfer';
+import { useFileReceiver, formatBytes, NETWORK_MODES } from '../hooks/useFileTransfer';
 import { getFileIcon } from '../components/FilePreview';
 
 function ReceivePage({ onTransferStateChange }) {
@@ -7,7 +7,7 @@ function ReceivePage({ onTransferStateChange }) {
     status, progress, speed, eta, error,
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, activeChunkSize,
-    networkMode, chunkTier, calibrating, connect, cleanup
+    networkMode, connect, cleanup
   } = useFileReceiver();
   const [inputCode, setInputCode] = useState('');
   const [autoConnecting, setAutoConnecting] = useState(false);
@@ -23,9 +23,9 @@ function ReceivePage({ onTransferStateChange }) {
   }, [status, connect, autoConnecting]);
 
   useEffect(() => {
-    const active = status === 'receiving' || status === 'connected' || status === 'connecting' || calibrating;
+    const active = status === 'receiving' || status === 'connected' || status === 'connecting';
     onTransferStateChange?.(active);
-  }, [status, calibrating, onTransferStateChange]);
+  }, [status, onTransferStateChange]);
 
   const handleConnect = () => { const c = inputCode.trim().toUpperCase(); if (c.length >= 4) connect(c); };
   const handleReset = () => { cleanup(); setInputCode(''); setAutoConnecting(false); };
@@ -61,13 +61,7 @@ function ReceivePage({ onTransferStateChange }) {
         <div className="glass-card slide-up">
           {peerDevice && <div className="device-badge" style={{ marginBottom: '0.75rem' }}>📱 Sender: {peerDevice}</div>}
 
-          {calibrating && (
-            <div style={{ textAlign: 'center' }}>
-              <div className="status-badge status-calibrating"><span className="status-dot"></span>Calibrating speed...</div>
-            </div>
-          )}
-
-          {!calibrating && net && status === 'connected' && fileList.length === 0 && (
+          {net && status === 'connected' && fileList.length === 0 && (
             <div style={{ textAlign: 'center' }}>
               <div className="network-badge" style={{ '--net-color': net.color }}>{net.icon} {net.label}</div>
               <div className="status-badge status-connected"><span className="status-dot"></span>Connected — waiting for file...</div>
@@ -96,7 +90,6 @@ function ReceivePage({ onTransferStateChange }) {
               {(networkMode || activeChunkSize > 0) && (
                 <div className="net-tier-row">
                   {networkMode && <div className="network-chip" style={{ '--net-color': NETWORK_MODES[networkMode].color }}>{NETWORK_MODES[networkMode].icon} {NETWORK_MODES[networkMode].label}</div>}
-                  {activeChunkSize > 0 && <div className="tier-chip">{formatBytes(activeChunkSize)} chunks</div>}
                 </div>
               )}
               <div className="ring-container">
