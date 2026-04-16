@@ -252,8 +252,12 @@ function SendPage({ onTransferStateChange }) {
               {receivers.length > 1 && <div className="receivers-title">{receivers.length} Devices</div>}
               {receivers.map((r) => {
                 const net = r.networkMode ? NETWORK_MODES[r.networkMode] : null;
-                // Use sender-local progress for immediate feedback, fall back to ACK progress
-                const displayProgress = r.senderProgress > r.progress ? r.senderProgress : r.progress;
+                // Use ACK progress as primary, sender estimate as fallback
+                // Cap sender progress to not exceed ACK progress by more than 5%
+                const ackProg = r.progress || 0;
+                const sndProg = r.senderProgress || 0;
+                const cappedSender = ackProg > 0 ? Math.min(sndProg, ackProg + 5) : sndProg;
+                const displayProgress = Math.max(cappedSender, ackProg);
                 const offset = circ - (displayProgress / 100) * circ;
                 // Use sender-local speed if receiver hasn't reported yet
                 const displaySpeed = r.speed > 0 ? r.speed : r.senderSpeed;
@@ -262,7 +266,7 @@ function SendPage({ onTransferStateChange }) {
                   ? (r.speed > 0 ? r.speedLabel : r.senderSpeedLabel)
                   : getSpeedLabel(0);
                 const displayEtc = r.etc && r.etc !== '' ? r.etc : (r.senderEtc || '');
-                const displayChunkSize = r.activeChunkSize ? formatBytes(r.activeChunkSize) : '128 KB';
+                const displayChunkSize = r.activeChunkSize ? formatBytes(r.activeChunkSize) : '64 KB';
 
                 return (
                   <div className="receiver-card" key={r.id}>

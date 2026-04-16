@@ -2,13 +2,13 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 128 * 1024;       // 128KB — good starting point, scales up adaptively
-const MAX_CHUNK  = 1024 * 1024;      // 1MB — max adaptive chunk for fast links
-const BUF_HI     = 4 * 1024 * 1024;  // 4MB — keep data channel pipeline full for speed
-const BUF_LO     = 512 * 1024;       // 512KB — resume sending quickly after drain
-const READ_AHEAD = 16;               // Read 16 chunks at a time — fewer disk reads
-const ACK_INTERVAL = 1000;           // Receiver ACK interval (ms) — 1s = less overhead
-const UI_INTERVAL  = 200;            // Sender UI throttle (ms)
+const CHUNK_SIZE = 64 * 1024;        // 64KB — safe WebRTC starting chunk
+const MAX_CHUNK  = 256 * 1024;       // 256KB — max safe SCTP message (Chrome/Safari limit)
+const BUF_HI     = 2 * 1024 * 1024;  // 2MB — HIGH watermark: pause sending when exceeded
+const BUF_LO     = 256 * 1024;       // 256KB — LOW watermark: resume after drain
+const READ_AHEAD = 32;               // Read 32 chunks at a time — large disk batches
+const ACK_INTERVAL = 800;            // Receiver ACK interval (ms)
+const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
 
 const NETWORK_MODES = {
   lan:      { label: 'LAN / Hotspot', icon: '🔌', color: '#22c55e', detail: 'Same network' },
@@ -18,20 +18,20 @@ const NETWORK_MODES = {
 };
 
 const CHUNK_TIERS = {
-  slow:   { size: 128 * 1024,  label: 'Slow',   bufHi: 1 * 1024 * 1024,  ahead: 8 },
-  normal: { size: 256 * 1024,  label: 'Normal', bufHi: 2 * 1024 * 1024,  ahead: 16 },
-  fast:   { size: 1024 * 1024, label: 'Fast',   bufHi: 4 * 1024 * 1024,  ahead: 32 },
+  slow:   { size: 64 * 1024,   label: 'Slow',   bufHi: 1 * 1024 * 1024,  ahead: 16 },
+  normal: { size: 128 * 1024,  label: 'Normal', bufHi: 2 * 1024 * 1024,  ahead: 32 },
+  fast:   { size: 256 * 1024,  label: 'Fast',   bufHi: 2 * 1024 * 1024,  ahead: 32 },
 };
 
 // ===== ADAPTIVE CHUNK SIZING =====
 // Returns an optimal chunk size based on current speed (bytes/sec)
+// Capped at 256KB — the safe SCTP message limit across all browsers
 function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
-  if (kbps < 200) return 128 * 1024;    // <200 KB/s → 128KB chunks
-  if (kbps < 500) return 256 * 1024;    // <500 KB/s → 256KB chunks
-  if (kbps < 2048) return 512 * 1024;   // <2 MB/s → 512KB chunks
-  return MAX_CHUNK;                      // ≥2 MB/s → 1MB chunks
+  if (kbps < 300) return 64 * 1024;      // <300 KB/s → 64KB chunks
+  if (kbps < 1024) return 128 * 1024;    // <1 MB/s  → 128KB chunks
+  return MAX_CHUNK;                       // ≥1 MB/s  → 256KB chunks
 }
 
 // ===== SPEED LABEL =====
@@ -191,11 +191,16 @@ function waitForDrain(dc) {
     const onLow = () => done();
     dc.addEventListener('bufferedamountlow', onLow);
 
-    // Safety poll every 20ms — some browsers don't fire the event reliably
+    // Safety poll every 16ms — align with frame timing
     const pollId = setInterval(() => {
       if (!dc || dc.readyState !== 'open' || dc.bufferedAmount <= BUF_LO) done();
-    }, 20);
+    }, 16);
   });
+}
+
+// Returns true if buffer has room (below high watermark)
+function bufferHasRoom(dc) {
+  return dc && dc.readyState === 'open' && dc.bufferedAmount <= BUF_HI;
 }
 
 
@@ -376,38 +381,30 @@ export function useFileSender() {
           }
         }
 
-        // Read a batch of chunks from disk
-        const batchEnd = Math.min(offset + currentChunkSize * READ_AHEAD, file.size);
-        const readPromises = [];
-        let cursor = offset;
-        while (cursor < batchEnd) {
-          const end = Math.min(cursor + currentChunkSize, file.size);
-          readPromises.push(file.slice(cursor, end).arrayBuffer());
-          cursor = end;
-        }
-        const buffers = await Promise.all(readPromises);
+        // Read a large batch from disk in one shot
+        const batchBytes = currentChunkSize * READ_AHEAD;
+        const batchEnd = Math.min(offset + batchBytes, file.size);
+        const bigBuf = await file.slice(offset, batchEnd).arrayBuffer();
+        const bigView = new Uint8Array(bigBuf);
 
-        for (const buf of buffers) {
+        // Split into chunks and fire them into the data channel
+        let pos = 0;
+        while (pos < bigView.length) {
           if (destroyedRef.current || conn._cancelled) break;
-          if (!buf || buf.byteLength === 0) continue;
-
-          // ALWAYS wait for drain BEFORE sending — prevents send-queue-full
-          await waitForDrain(dc);
           if (!dc || dc.readyState !== 'open') break;
 
-          // Check both local and remote pause
-          await waitIfPaused(pausedRef, destroyedRef, isRemotePaused);
-          if (destroyedRef.current || conn._cancelled) break;
+          const end = Math.min(pos + currentChunkSize, bigView.length);
+          const chunk = bigView.slice(pos, end);
 
+          // Send FIRST, then check buffer — this keeps the pipeline full
           try {
-            dc.send(buf);
+            dc.send(chunk);
           } catch (err) {
-            // If send still fails (extremely rare), wait and retry once
-            console.warn('[DropBeam] send failed, waiting for drain...', err.message);
+            // Buffer overflow — wait for drain and retry
             await waitForDrain(dc);
             if (!dc || dc.readyState !== 'open') break;
             try {
-              dc.send(buf);
+              dc.send(chunk);
             } catch (err2) {
               console.error('[DropBeam] send failed after retry', err2.message);
               updateReceiver(receiverId, { status: 'error', error: 'Send failed' });
@@ -415,11 +412,24 @@ export function useFileSender() {
             }
           }
 
-          offset += buf.byteLength;
-          globalBytesSent += buf.byteLength;
+          pos += chunk.byteLength;
+          offset += chunk.byteLength;
+          globalBytesSent += chunk.byteLength;
           chunksSent++;
 
-          // === Sender-local speed + immediate progress ===
+          // === BACKPRESSURE: only wait when buffer exceeds HIGH watermark ===
+          // This is the KEY speed optimization — let the buffer fill up to BUF_HI
+          // before pausing, instead of waiting before every single send.
+          if (dc.bufferedAmount > BUF_HI) {
+            await waitForDrain(dc);
+          }
+
+          // Check pause (but don't await every iteration — only when actually paused)
+          if (pausedRef.current || conn._remotePaused) {
+            await waitIfPaused(pausedRef, destroyedRef, isRemotePaused);
+          }
+
+          // === Speed tracking (use bytes on wire, not bytes in buffer) ===
           const now = Date.now();
           senderSpeedSamples.push({ time: now, bytes: globalBytesSent });
           // Keep only last 3 seconds of samples
@@ -434,8 +444,11 @@ export function useFileSender() {
             }
           }
 
-          const senderPct = grandTotal > 0 ? Math.min(99, Math.round((globalBytesSent / grandTotal) * 100)) : 0;
-          const remainingSec = senderLocalSpeed > 0 ? (grandTotal - globalBytesSent) / senderLocalSpeed : 0;
+          // Progress based on bytes confirmed on-wire (subtract what's still buffered)
+          const bytesOnWire = Math.max(0, globalBytesSent - (dc.bufferedAmount || 0));
+          const senderPct = grandTotal > 0 ? Math.min(99, Math.round((bytesOnWire / grandTotal) * 100)) : 0;
+          const remaining = grandTotal - bytesOnWire;
+          const remainingSec = senderLocalSpeed > 0 ? remaining / senderLocalSpeed : 0;
           const senderEta = senderLocalSpeed > 0 ? formatTime(remainingSec) : '--:--';
           const senderEtc = senderLocalSpeed > 0
             ? new Date(Date.now() + remainingSec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
@@ -443,7 +456,7 @@ export function useFileSender() {
           const recalcTotalChunks = Math.ceil(grandTotal / currentChunkSize);
 
           throttledUpdate({
-            bytesSent: globalBytesSent,
+            bytesSent: bytesOnWire,
             bytesTotal: grandTotal,
             senderProgress: senderPct,
             senderSpeed: senderLocalSpeed,
@@ -514,7 +527,10 @@ export function useFileSender() {
           resolve();
         }
       }, 100);
-      const sid = setTimeout(() => { dc.removeEventListener('message', onMsg); clearInterval(cancelCheck); resolve(); }, 15000);
+      // Dynamic timeout: at least 60s, or 3× the estimated remaining time at minimum 30KB/s
+      const remainingBytes = Math.max(0, grandTotal - receiverBytes);
+      const dynTimeout = Math.max(60000, Math.ceil((remainingBytes / (30 * 1024)) * 3000));
+      const sid = setTimeout(() => { dc.removeEventListener('message', onMsg); clearInterval(cancelCheck); resolve(); }, dynTimeout);
     });
 
     flushUpdate();
@@ -655,14 +671,21 @@ export function useFileSender() {
 
   useEffect(() => cleanup, [cleanup]);
 
-  const allDone = receivers.length > 0 && receivers.every(r => r.status === 'done' || r.status === 'error' || r.status === 'disconnected' || r.status === 'cancelled');
+  const allTerminal = receivers.length > 0 && receivers.every(r => r.status === 'done' || r.status === 'error' || r.status === 'disconnected' || r.status === 'cancelled');
+  const anySuccess = receivers.some(r => r.status === 'done');
   useEffect(() => {
-    if (allDone && statusRef.current === 'transferring') {
-      setStatus('done');
-      setCodeExpiry(Date.now() + 10 * 60 * 1000);
-      expiryRef.current = setTimeout(() => { cleanup(); setCode(''); setCodeExpiry(null); }, 10 * 60 * 1000);
+    if (allTerminal && statusRef.current === 'transferring') {
+      if (anySuccess) {
+        setStatus('done');
+        setCodeExpiry(Date.now() + 10 * 60 * 1000);
+        expiryRef.current = setTimeout(() => { cleanup(); setCode(''); setCodeExpiry(null); }, 10 * 60 * 1000);
+      } else {
+        // All receivers failed or disconnected — don't show "done", show error
+        setStatus('error');
+        setError('Transfer failed — all receivers disconnected');
+      }
     }
-  }, [allDone, cleanup]);
+  }, [allTerminal, anySuccess, cleanup]);
 
   return {
     status, code, files, setFiles, error, codeExpiry,
