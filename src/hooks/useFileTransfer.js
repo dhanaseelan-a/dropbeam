@@ -2,13 +2,13 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 16 * 1024;        // 16KB — Safe starting chunk to probe network limits
-const MAX_CHUNK  = 1024 * 1024;      // 1MB — User-requested ultra-high maximal chunk
-const BUF_HI     = 4 * 1024 * 1024;  // 4MB — High watermark
-const BUF_LO     = 1024 * 1024;      // 1MB — Low watermark
-const READ_AHEAD = 64;               // Run 64 loops at a time
-const ACK_INTERVAL = 400;            // Receiver ACK interval (ms)
-const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
+const CHUNK_SIZE = 64 * 1024;         // 64KB — Larger initial chunk to reduce per-message SCTP overhead
+const MAX_CHUNK  = 256 * 1024;        // 256KB — Safe max for all browsers/SCTP implementations
+const BUF_HI     = 1 * 1024 * 1024;   // 1MB — High watermark (was 4MB — over-buffered on slow links)
+const BUF_LO     = 128 * 1024;        // 128KB — Low watermark (was 1MB — caused 18s stalls at 56KB/s)
+const READ_AHEAD = 16;                // Read 16 chunks at a time (was 64 — too large for slow connections)
+const ACK_INTERVAL = 200;             // Receiver ACK interval (ms) — faster speed feedback loop
+const UI_INTERVAL  = 200;             // Sender UI throttle (ms)
 
 const NETWORK_MODES = {
   lan:      { label: 'LAN / Hotspot', icon: '🔌', color: '#22c55e', detail: 'Same network' },
@@ -18,22 +18,21 @@ const NETWORK_MODES = {
 };
 
 const CHUNK_TIERS = {
-  slow:   { size: 64 * 1024,   label: 'Slow',   bufHi: 1 * 1024 * 1024,  ahead: 16 },
-  normal: { size: 128 * 1024,  label: 'Normal', bufHi: 2 * 1024 * 1024,  ahead: 32 },
-  fast:   { size: 256 * 1024,  label: 'Fast',   bufHi: 2 * 1024 * 1024,  ahead: 32 },
+  slow:   { size: 64 * 1024,   label: 'Slow',   bufHi: 512 * 1024,       ahead: 8 },
+  normal: { size: 128 * 1024,  label: 'Normal', bufHi: 1 * 1024 * 1024,  ahead: 16 },
+  fast:   { size: 256 * 1024,  label: 'Fast',   bufHi: 1 * 1024 * 1024,  ahead: 16 },
 };
 
 // ===== ADAPTIVE CHUNK SIZING =====
-// Dynamically scales chunk size from 16KB all the way up to 1MB based on true network speed.
+// Dynamically scales chunk size based on true network speed.
+// More aggressive ramp-up to reduce per-message SCTP overhead on internet connections.
 function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
-  if (kbps < 300) return 32 * 1024;      // <300 KB/s → 32KB
-  if (kbps < 1000) return 64 * 1024;     // <1 MB/s  → 64KB
-  if (kbps < 2500) return 128 * 1024;    // <2.5 MB/s → 128KB
-  if (kbps < 5000) return 256 * 1024;    // <5 MB/s   → 256KB
-  if (kbps < 8000) return 512 * 1024;    // <8 MB/s   → 512KB
-  return MAX_CHUNK;                      // Fast      → 1MB (Extreme)
+  if (kbps < 100) return 32 * 1024;      // <100 KB/s  → 32KB
+  if (kbps < 500) return 64 * 1024;      // <500 KB/s  → 64KB
+  if (kbps < 2000) return 128 * 1024;    // <2 MB/s    → 128KB
+  return MAX_CHUNK;                      // >=2 MB/s   → 256KB
 }
 
 // ===== SPEED LABEL =====
@@ -117,8 +116,13 @@ const ICE = [
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
-  { urls: 'stun:stun.services.mozilla.com' },
-  { urls: 'stun:stun.cloudflare.com:3478' }
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  // TURN — CRITICAL for internet transfers when both peers are behind symmetric NATs.
+  // Without TURN, PeerJS falls back to its slow relay (~56KB/s cap).
+  { urls: 'turn:openrelay.metered.ca:80',                username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443',               username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
 function getDC(conn) {
@@ -397,8 +401,8 @@ export function useFileSender() {
             dc.send(chunk);
           } catch (err) {
             // Buffer overflow OR WebRTC Message Too Large Exception
-            if (err.name === 'TypeError' || String(err).includes('too large') || currentChunkSize > 256 * 1024) {
-               // Browser strictly rejected 1MB or 512KB chunks. Step down permanently.
+            if (err.name === 'TypeError' || String(err).includes('too large') || currentChunkSize > 64 * 1024) {
+               // Browser rejected chunk — step down to reduce message size
                currentChunkSize = Math.max(16 * 1024, Math.floor(currentChunkSize / 2));
                lastSentChunkSize = currentChunkSize;
                dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
