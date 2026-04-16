@@ -2,12 +2,13 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 256 * 1024;       // 256KB per dc.send() call
-const BUF_HI     = 2 * 1024 * 1024;  // 2MB — balanced for internet + LAN
-const BUF_LO     = 256 * 1024;       // Resume sooner = less stall time on slow links
-const READ_AHEAD = 16;               // Read 16 chunks (4MB) from disk at a time
-const ACK_INTERVAL = 300;            // Receiver ACK interval (ms) — less overhead
-const UI_INTERVAL  = 200;            // Sender UI throttle (ms)
+const CHUNK_SIZE = 64 * 1024;        // 64KB — reliable on internet/relay, scales up adaptively
+const MAX_CHUNK  = 256 * 1024;       // Max adaptive chunk size for fast links
+const BUF_HI     = 1 * 1024 * 1024;  // 1MB — lower pressure for internet transfers
+const BUF_LO     = 128 * 1024;       // Resume sooner = less stall time on slow links
+const READ_AHEAD = 8;                // Read 8 chunks at a time — less memory pressure
+const ACK_INTERVAL = 500;            // Receiver ACK interval (ms) — reduced overhead on slow links
+const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
 
 const NETWORK_MODES = {
   lan:      { label: 'LAN / Hotspot', icon: '🔌', color: '#22c55e', detail: 'Same network' },
@@ -17,8 +18,20 @@ const NETWORK_MODES = {
 };
 
 const CHUNK_TIERS = {
-  fast: { size: CHUNK_SIZE, label: 'Fast', bufHi: BUF_HI, ahead: READ_AHEAD },
+  slow:   { size: 64 * 1024,  label: 'Slow',   bufHi: 512 * 1024,      ahead: 4 },
+  normal: { size: 128 * 1024, label: 'Normal', bufHi: 1 * 1024 * 1024, ahead: 8 },
+  fast:   { size: 256 * 1024, label: 'Fast',   bufHi: 2 * 1024 * 1024, ahead: 16 },
 };
+
+// ===== ADAPTIVE CHUNK SIZING =====
+// Returns an optimal chunk size based on current speed (bytes/sec)
+function getAdaptiveChunk(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
+  const kbps = bytesPerSec / 1024;
+  if (kbps < 200) return 64 * 1024;     // <200 KB/s → 64KB chunks
+  if (kbps < 1024) return 128 * 1024;   // <1 MB/s → 128KB chunks
+  return MAX_CHUNK;                      // ≥1 MB/s → 256KB chunks
+}
 
 // ===== SPEED LABEL =====
 function getSpeedLabel(bytesPerSec) {
@@ -314,7 +327,15 @@ export function useFileSender() {
       }
     };
 
-    updateReceiver(receiverId, { status: 'transferring', progress: 0, speed: 0, eta: '', activeChunkSize: CHUNK_SIZE, speedLabel: getSpeedLabel(0) });
+    let currentChunkSize = CHUNK_SIZE;
+    let chunksSent = 0;
+    const totalChunks = Math.ceil(grandTotal / currentChunkSize);
+
+    updateReceiver(receiverId, {
+      status: 'transferring', progress: 0, speed: 0, eta: '', etc: '',
+      activeChunkSize: currentChunkSize, speedLabel: getSpeedLabel(0),
+      chunksSent: 0, totalChunks,
+    });
 
     dcSendJSON(dc, {
       type: 'file-list',
@@ -344,12 +365,17 @@ export function useFileSender() {
         await waitIfPaused(pausedRef, destroyedRef, isRemotePaused);
         if (destroyedRef.current || conn._cancelled) break;
 
+        // Adaptive chunk sizing based on current speed
+        if (senderLocalSpeed > 0) {
+          currentChunkSize = getAdaptiveChunk(senderLocalSpeed);
+        }
+
         // Read a batch of chunks from disk
-        const batchEnd = Math.min(offset + CHUNK_SIZE * READ_AHEAD, file.size);
+        const batchEnd = Math.min(offset + currentChunkSize * READ_AHEAD, file.size);
         const readPromises = [];
         let cursor = offset;
         while (cursor < batchEnd) {
-          const end = Math.min(cursor + CHUNK_SIZE, file.size);
+          const end = Math.min(cursor + currentChunkSize, file.size);
           readPromises.push(file.slice(cursor, end).arrayBuffer());
           cursor = end;
         }
@@ -385,8 +411,9 @@ export function useFileSender() {
 
           offset += buf.byteLength;
           globalBytesSent += buf.byteLength;
+          chunksSent++;
 
-          // === FIX #1: Sender-local speed + immediate progress ===
+          // === Sender-local speed + immediate progress ===
           const now = Date.now();
           senderSpeedSamples.push({ time: now, bytes: globalBytesSent });
           // Keep only last 3 seconds of samples
@@ -402,7 +429,12 @@ export function useFileSender() {
           }
 
           const senderPct = grandTotal > 0 ? Math.min(99, Math.round((globalBytesSent / grandTotal) * 100)) : 0;
-          const senderEta = senderLocalSpeed > 0 ? formatTime((grandTotal - globalBytesSent) / senderLocalSpeed) : '--:--';
+          const remainingSec = senderLocalSpeed > 0 ? (grandTotal - globalBytesSent) / senderLocalSpeed : 0;
+          const senderEta = senderLocalSpeed > 0 ? formatTime(remainingSec) : '--:--';
+          const senderEtc = senderLocalSpeed > 0
+            ? new Date(Date.now() + remainingSec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
+            : '';
+          const recalcTotalChunks = Math.ceil(grandTotal / currentChunkSize);
 
           throttledUpdate({
             bytesSent: globalBytesSent,
@@ -410,7 +442,11 @@ export function useFileSender() {
             senderProgress: senderPct,
             senderSpeed: senderLocalSpeed,
             senderEta: senderEta,
+            senderEtc: senderEtc,
             senderSpeedLabel: getSpeedLabel(senderLocalSpeed),
+            activeChunkSize: currentChunkSize,
+            chunksSent,
+            totalChunks: recalcTotalChunks,
           });
         }
 
@@ -535,10 +571,11 @@ export function useFileSender() {
 
         const newReceiver = {
           id: receiverId, conn, device: '', status: 'connecting',
-          progress: 0, speed: 0, eta: '', networkMode: null,
+          progress: 0, speed: 0, eta: '', etc: '', networkMode: null,
           currentFile: 0, avgSpeed: 0, totalTime: 0, totalBytes: 0,
           speedLabel: getSpeedLabel(0), remotePaused: false,
-          senderProgress: 0, senderSpeed: 0, senderEta: '',
+          chunksSent: 0, totalChunks: 0,
+          senderProgress: 0, senderSpeed: 0, senderEta: '', senderEtc: '',
           senderSpeedLabel: getSpeedLabel(0),
         };
         setReceivers(prev => [...prev, newReceiver]);
@@ -677,7 +714,8 @@ export function useFileReceiver() {
 
   // UI batching
   const rafRef = useRef(null);
-  const pendingUIRef = useRef({ progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null });
+  const [etc, setEtc] = useState('');
+  const pendingUIRef = useRef({ progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null, etc: null });
 
   const isTransferring = status === 'receiving' || status === 'connected';
   useBeforeUnload(isTransferring);
@@ -692,17 +730,19 @@ export function useFileReceiver() {
     if (p.speedLabel !== null) setSpeedLabel(p.speedLabel);
     if (p.bytesReceived !== null) setBytesReceived(p.bytesReceived);
     if (p.bytesTotal !== null) setBytesTotal(p.bytesTotal);
-    pendingUIRef.current = { progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null };
+    if (p.etc !== null) setEtc(p.etc);
+    pendingUIRef.current = { progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null, etc: null };
     rafRef.current = null;
   }, []);
 
-  const scheduleUI = useCallback((pct, spd, etaStr, spdLabel, received, total) => {
+  const scheduleUI = useCallback((pct, spd, etaStr, spdLabel, received, total, etcStr) => {
     pendingUIRef.current.progress = pct;
     if (spd !== undefined) pendingUIRef.current.speed = spd;
     if (etaStr !== undefined) pendingUIRef.current.eta = etaStr;
     if (spdLabel !== undefined) pendingUIRef.current.speedLabel = spdLabel;
     if (received !== undefined) pendingUIRef.current.bytesReceived = received;
     if (total !== undefined) pendingUIRef.current.bytesTotal = total;
+    if (etcStr !== undefined) pendingUIRef.current.etc = etcStr;
     if (!rafRef.current) rafRef.current = requestAnimationFrame(flushUI);
   }, [flushUI]);
 
@@ -741,12 +781,18 @@ export function useFileReceiver() {
     lastSpeedRef.current = spd;
 
     const rem = total - received;
-    const etaStr = spd > 0 ? formatTime(rem / spd) : '--:--';
+    const remainingSec = spd > 0 ? rem / spd : 0;
+    const etaStr = spd > 0 ? formatTime(remainingSec) : '--:--';
     lastEtaRef.current = etaStr;
+
+    // Estimated completion time
+    const etcStr = spd > 0
+      ? new Date(Date.now() + remainingSec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
+      : '';
 
     const pct = total > 0 ? (received >= total ? 100 : Math.min(99, Math.round((received / total) * 100))) : 0;
     const spdLabel = getSpeedLabel(spd);
-    scheduleUI(pct, spd, etaStr, spdLabel, received, total);
+    scheduleUI(pct, spd, etaStr, spdLabel, received, total, etcStr);
 
     try {
       dc.send(JSON.stringify({
@@ -1014,7 +1060,7 @@ export function useFileReceiver() {
     dcRef.current = null;
     if (connRef.current) { connRef.current.close(); connRef.current = null; }
     if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null; }
-    setStatus('idle'); setError(''); setProgress(0); setSpeed(0); setEta('');
+    setStatus('idle'); setError(''); setProgress(0); setSpeed(0); setEta(''); setEtc('');
     setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
     setTransferStats(null); setPeerDevice(null); setNetworkMode(null); setActiveChunkSize(0);
     setSpeedLabel(getSpeedLabel(0)); setRemotePaused(false); setPaused(false);
@@ -1024,7 +1070,7 @@ export function useFileReceiver() {
   useEffect(() => cleanup, [cleanup]);
 
   return {
-    status, progress, speed: formatBytes(speed) + '/s', speedRaw: speed, eta, error,
+    status, progress, speed: formatBytes(speed) + '/s', speedRaw: speed, eta, etc, error,
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, networkMode, activeChunkSize,
     speedLabel, remotePaused, paused, togglePause,

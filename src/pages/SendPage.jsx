@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useDropzone } from 'react-dropzone';
 import JSZip from 'jszip';
 import { QRCodeSVG } from 'qrcode.react';
-import { useFileSender, formatBytes, NETWORK_MODES, getSpeedLabel } from '../hooks/useFileTransfer';
+import { useFileSender, formatBytes, NETWORK_MODES, getSpeedLabel, formatTime } from '../hooks/useFileTransfer';
 import { FilePreview, FileThumbnail, getFileIcon } from '../components/FilePreview';
 
 function SendPage({ onTransferStateChange }) {
@@ -261,6 +261,8 @@ function SendPage({ onTransferStateChange }) {
                 const displaySpeedLabel = displaySpeed > 0
                   ? (r.speed > 0 ? r.speedLabel : r.senderSpeedLabel)
                   : getSpeedLabel(0);
+                const displayEtc = r.etc && r.etc !== '' ? r.etc : (r.senderEtc || '');
+                const displayChunkSize = r.activeChunkSize ? formatBytes(r.activeChunkSize) : '64 KB';
 
                 return (
                   <div className="receiver-card" key={r.id}>
@@ -299,10 +301,26 @@ function SendPage({ onTransferStateChange }) {
                                 </span>
                               )}
                             </div>
-                            <div className="receiver-meta">
-                              {displayEta && <span>⏱ {displayEta} remaining</span>}
+                            <div className="transfer-detail-grid">
+                              <div className="detail-row">
+                                <span className="detail-label">Transferred</span>
+                                <span className="detail-value">{formatBytes(r.bytesSent || 0)} / {formatBytes(r.bytesTotal || 0)}</span>
+                              </div>
+                              <div className="detail-row">
+                                <span className="detail-label">Chunk</span>
+                                <span className="detail-value">{displayChunkSize} × {r.chunksSent || 0}{r.totalChunks ? ` / ${r.totalChunks}` : ''}</span>
+                              </div>
+                              <div className="detail-row">
+                                <span className="detail-label">Remaining</span>
+                                <span className="detail-value">{displayEta || '--:--'}</span>
+                              </div>
+                              {displayEtc && (
+                                <div className="detail-row">
+                                  <span className="detail-label">Est. Done</span>
+                                  <span className="detail-value">{displayEtc}</span>
+                                </div>
+                              )}
                             </div>
-                            <div className="receiver-chunks">{formatBytes(r.bytesSent)} / {formatBytes(r.bytesTotal)}</div>
                           </div>
                         </div>
                       </>
