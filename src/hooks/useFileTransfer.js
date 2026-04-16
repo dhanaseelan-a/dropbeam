@@ -2,10 +2,10 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 128 * 1024;       // 128KB — aggressive starting chunk for fast ramp-up
-const MAX_CHUNK  = 256 * 1024;       // 256KB — max safe SCTP message
-const BUF_HI     = 4 * 1024 * 1024;  // 4MB — Massive HIGH watermark for high-latency throughput
-const BUF_LO     = 1024 * 1024;      // 1MB — LOW watermark
+const CHUNK_SIZE = 256 * 1024;       // 256KB — ABSOLUTE MAX PROTOCOL CHUNK SIZE
+const MAX_CHUNK  = 256 * 1024;       // 256KB
+const BUF_HI     = 8 * 1024 * 1024;  // 8MB — Extreme high watermark
+const BUF_LO     = 2 * 1024 * 1024;  // 2MB — Extreme low watermark
 const READ_AHEAD = 32;               // Read 32 chunks at a time
 const ACK_INTERVAL = 400;            // Receiver ACK interval (ms)
 const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
@@ -23,15 +23,10 @@ const CHUNK_TIERS = {
   fast:   { size: 256 * 1024,  label: 'Fast',   bufHi: 2 * 1024 * 1024,  ahead: 32 },
 };
 
-// ===== ADAPTIVE CHUNK SIZING =====
-// Returns an optimal chunk size based on current speed (bytes/sec)
-// Capped at 256KB — the safe SCTP message limit across all browsers
-function getAdaptiveChunk(bytesPerSec) {
-  if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
-  const kbps = bytesPerSec / 1024;
-  if (kbps < 300) return 64 * 1024;      // <300 KB/s → 64KB chunks
-  if (kbps < 1000) return 128 * 1024;    // <1 MB/s  → 128KB chunks
-  return MAX_CHUNK;                      // ≥1 MB/s  → 256KB chunks
+// ===== ADAPTIVE CHUNK SIZING REMOVED =====
+// User requested maximum flat chunk sizes without adapting downwards.
+function getAdaptiveChunk() {
+  return CHUNK_SIZE; // Always 256KB
 }
 
 // ===== SPEED LABEL =====
