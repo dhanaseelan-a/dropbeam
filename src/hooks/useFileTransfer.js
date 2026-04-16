@@ -5,7 +5,7 @@ import Peer from 'peerjs';
 const CHUNK_SIZE = 64 * 1024;        // 64KB — safe WebRTC starting chunk
 const MAX_CHUNK  = 256 * 1024;       // 256KB — max safe SCTP message (Chrome/Safari limit)
 const BUF_HI     = 2 * 1024 * 1024;  // 2MB — HIGH watermark: pause sending when exceeded
-const BUF_LO     = 256 * 1024;       // 256KB — LOW watermark: resume after drain
+const BUF_LO     = 512 * 1024;       // 512KB — LOW watermark: resume after drain
 const READ_AHEAD = 32;               // Read 32 chunks at a time — large disk batches
 const ACK_INTERVAL = 800;            // Receiver ACK interval (ms)
 const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
@@ -109,14 +109,30 @@ function playDone() {
 }
 
 const ICE = [
+  // STUN — discover public IP for NAT traversal
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
-  // Additional STUN for better NAT traversal on internet
-  { urls: 'stun:stun.stunprotocol.org:3478' },
-  { urls: 'stun:stun.voip.blackberry.com:3478' },
+  // TURN — relay when direct P2P fails (symmetric NAT, strict firewall, mobile data)
+  // Without TURN, PeerJS falls back to its slow WebSocket relay (~300KB/s cap)
+  {
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:80?transport=tcp',
+      'turn:openrelay.metered.ca:443',
+      'turn:openrelay.metered.ca:443?transport=tcp',
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  // TLS-secured TURN — works through strict firewalls that block non-443 ports
+  {
+    urls: 'turns:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
 
 function getDC(conn) {
@@ -574,7 +590,7 @@ export function useFileSender() {
 
     const myCode = generateCode();
     const peer = new Peer(myCode, {
-      config: { iceServers: ICE, sdpSemantics: 'unified-plan' },
+      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
       debug: 0
     });
 
@@ -1012,7 +1028,7 @@ export function useFileReceiver() {
     setPaused(false);
 
     const peer = new Peer({
-      config: { iceServers: ICE, sdpSemantics: 'unified-plan' },
+      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
       debug: 0
     });
 
