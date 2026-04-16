@@ -7,7 +7,7 @@ const MAX_CHUNK  = 256 * 1024;       // 256KB — max safe SCTP message (Chrome/
 const BUF_HI     = 2 * 1024 * 1024;  // 2MB — HIGH watermark: pause sending when exceeded
 const BUF_LO     = 512 * 1024;       // 512KB — LOW watermark: resume after drain
 const READ_AHEAD = 32;               // Read 32 chunks at a time — large disk batches
-const ACK_INTERVAL = 800;            // Receiver ACK interval (ms)
+const ACK_INTERVAL = 400;            // Receiver ACK interval (ms)
 const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
 
 const NETWORK_MODES = {
@@ -265,46 +265,8 @@ export function useFileSender() {
     });
   }, []);
 
-  // ---- TRANSFER ENGINE ----
+  // ---- TRANSFER ENGINE (rewritten for speed) ----
   const transferToReceiver = useCallback(async (receiverId, conn, filesToSend) => {
-    let pendingUpdate = null;
-    let updateTimer = null;
-    let lastUpdateTime = 0;
-
-    // Sender-local speed tracking
-    const senderSpeedSamples = [];
-    let senderLocalSpeed = 0;
-
-    const throttledUpdate = (upd) => {
-      pendingUpdate = pendingUpdate ? { ...pendingUpdate, ...upd } : upd;
-      const now = Date.now();
-      if (now - lastUpdateTime >= UI_INTERVAL) {
-        if (updateTimer) clearTimeout(updateTimer);
-        lastUpdateTime = now;
-        updateReceiver(receiverId, pendingUpdate);
-        pendingUpdate = null;
-      } else if (!updateTimer) {
-        updateTimer = setTimeout(() => {
-          updateTimer = null;
-          if (pendingUpdate) {
-            lastUpdateTime = Date.now();
-            updateReceiver(receiverId, pendingUpdate);
-            pendingUpdate = null;
-          }
-        }, UI_INTERVAL - (now - lastUpdateTime));
-      }
-    };
-
-    const flushUpdate = () => {
-      if (updateTimer) clearTimeout(updateTimer);
-      updateTimer = null;
-      if (pendingUpdate) {
-        lastUpdateTime = Date.now();
-        updateReceiver(receiverId, pendingUpdate);
-        pendingUpdate = null;
-      }
-    };
-
     const dc = getDC(conn);
     if (!dc || dc.readyState !== 'open') {
       updateReceiver(receiverId, { status: 'error', error: 'Channel not open' });
@@ -312,23 +274,34 @@ export function useFileSender() {
     }
     dc.binaryType = 'arraybuffer';
 
+    const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
+    const startTime = Date.now();
+    let globalBytesSent = 0;
+    let chunksSent = 0;
+    let currentChunkSize = CHUNK_SIZE;
+    let lastSentChunkSize = currentChunkSize;
     let receiverBytes = 0;
+    let currentSpeed = 0;
+    let transferDone = false; // flag to stop the progress timer
 
-    // Remote pause flag — set when receiver sends pause, checked in send loop
+    // Remote pause flag
     conn._remotePaused = false;
+    conn._cancelled = false;
 
+    // ===== INCOMING MESSAGES FROM RECEIVER =====
     dc.onmessage = (event) => {
       if (typeof event.data === 'string') {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'ack') {
             if (msg.received != null) receiverBytes = Math.max(receiverBytes, msg.received);
+            // Forward receiver's progress/speed to UI
             const updObj = { progress: msg.progress ?? 0, eta: msg.eta || '' };
             if (msg.speed > 0) {
               updObj.speed = msg.speed;
               updObj.speedLabel = getSpeedLabel(msg.speed);
             }
-            throttledUpdate(updObj);
+            updateReceiver(receiverId, updObj);
           }
           if (msg.type === 'cancel') {
             conn._cancelled = true;
@@ -349,18 +322,77 @@ export function useFileSender() {
       }
     };
 
-    let currentChunkSize = CHUNK_SIZE;
-    let lastSentChunkSize = currentChunkSize; // Track to detect changes
-    let chunksSent = 0;
-    const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
-    const startTime = Date.now();
-    let globalBytesSent = 0;
-    const totalChunks = Math.ceil(grandTotal / currentChunkSize);
+    // ===== PROGRESS TIMER — runs every 200ms, decoupled from send loop =====
+    // This fixes:
+    //   1. "0 B" bug — uses globalBytesSent directly (not subtracted by bufferedAmount)
+    //   2. Speed=0 bug — samples are taken at real 200ms intervals, not per-chunk
+    //   3. Performance — all formatting (toLocaleTimeString, getSpeedLabel) moved here
+    let prevSampleTime = Date.now();
+    let prevSampleBytes = 0;
+    const speedWindow = []; // rolling 3-second window
 
+    const progressTimer = setInterval(() => {
+      if (transferDone) return;
+      const now = Date.now();
+
+      // ---- Speed: track actual bytes leaving the buffer (drain rate) ----
+      // bytesOnWire = bytes sent minus what's still in the buffer
+      const bytesOnWire = Math.max(0, globalBytesSent - (dc.bufferedAmount || 0));
+      speedWindow.push({ time: now, bytes: bytesOnWire });
+
+      // Trim to last 3 seconds
+      while (speedWindow.length > 2 && now - speedWindow[0].time > 3000) {
+        speedWindow.shift();
+      }
+
+      if (speedWindow.length >= 2) {
+        const oldest = speedWindow[0];
+        const dt = (now - oldest.time) / 1000;
+        if (dt > 0.1) { // need at least 100ms of data
+          currentSpeed = (bytesOnWire - oldest.bytes) / dt;
+        }
+      }
+
+      // ---- Adaptive chunk sizing ----
+      if (currentSpeed > 0) {
+        currentChunkSize = getAdaptiveChunk(currentSpeed);
+        if (currentChunkSize !== lastSentChunkSize) {
+          lastSentChunkSize = currentChunkSize;
+          dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
+        }
+      }
+
+      // ---- Progress ----
+      // Use globalBytesSent for immediate feedback (not bytesOnWire which causes "0 B")
+      const displayBytes = globalBytesSent;
+      const pct = grandTotal > 0 ? Math.min(99, Math.round((displayBytes / grandTotal) * 100)) : 0;
+      const remaining = grandTotal - displayBytes;
+      const remainingSec = currentSpeed > 0 ? remaining / currentSpeed : 0;
+      const eta = currentSpeed > 0 ? formatTime(remainingSec) : '--:--';
+      const etc = currentSpeed > 0
+        ? new Date(now + remainingSec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
+        : '';
+      const totalChunks = Math.ceil(grandTotal / currentChunkSize);
+
+      updateReceiver(receiverId, {
+        bytesSent: displayBytes,
+        bytesTotal: grandTotal,
+        senderProgress: pct,
+        senderSpeed: currentSpeed,
+        senderEta: eta,
+        senderEtc: etc,
+        senderSpeedLabel: getSpeedLabel(currentSpeed),
+        activeChunkSize: currentChunkSize,
+        chunksSent,
+        totalChunks,
+      });
+    }, 200);
+
+    // ===== INITIAL STATE =====
     updateReceiver(receiverId, {
       status: 'transferring', progress: 0, speed: 0, eta: '', etc: '',
       activeChunkSize: currentChunkSize, speedLabel: getSpeedLabel(0),
-      chunksSent: 0, totalChunks,
+      chunksSent: 0, totalChunks: Math.ceil(grandTotal / currentChunkSize),
     });
 
     dcSendJSON(dc, {
@@ -370,136 +402,91 @@ export function useFileSender() {
       chunkSize: currentChunkSize
     });
 
+    // ===== FILE SEND LOOP =====
+    const isRemotePaused = () => !!conn._remotePaused;
+
     for (let fi = 0; fi < filesToSend.length; fi++) {
       if (destroyedRef.current || conn._cancelled) break;
       const file = filesToSend[fi];
-      throttledUpdate({ currentFile: fi });
+      updateReceiver(receiverId, { currentFile: fi });
 
       dcSendJSON(dc, { type: 'file-start', index: fi, name: file.name, size: file.size, fileType: file.type });
 
       let offset = 0;
 
-      // Remote pause checker for this connection
-      const isRemotePaused = () => !!conn._remotePaused;
-
       while (offset < file.size) {
         if (destroyedRef.current || conn._cancelled) break;
+        if (!dc || dc.readyState !== 'open') break;
+
         await waitIfPaused(pausedRef, destroyedRef, isRemotePaused);
         if (destroyedRef.current || conn._cancelled) break;
 
-        // Adaptive chunk sizing based on current speed
-        if (senderLocalSpeed > 0) {
-          currentChunkSize = getAdaptiveChunk(senderLocalSpeed);
-          // Notify receiver when chunk size changes so UI stays in sync
-          if (currentChunkSize !== lastSentChunkSize) {
-            lastSentChunkSize = currentChunkSize;
-            dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
-          }
-        }
-
-        // Read a large batch from disk in one shot
+        // Read a large batch from disk
         const batchBytes = currentChunkSize * READ_AHEAD;
         const batchEnd = Math.min(offset + batchBytes, file.size);
         const bigBuf = await file.slice(offset, batchEnd).arrayBuffer();
         const bigView = new Uint8Array(bigBuf);
 
-        // Split into chunks and fire them into the data channel
+        // ===== HOT INNER LOOP — minimal overhead =====
+        // Only: send, increment counters, backpressure check
+        // NO speed tracking, NO formatting, NO object creation
         let pos = 0;
         while (pos < bigView.length) {
           if (destroyedRef.current || conn._cancelled) break;
           if (!dc || dc.readyState !== 'open') break;
 
           const end = Math.min(pos + currentChunkSize, bigView.length);
-          const chunk = bigView.slice(pos, end);
+          // subarray = zero-copy view (no allocation)
+          const chunk = bigView.subarray(pos, end);
 
-          // Send FIRST, then check buffer — this keeps the pipeline full
           try {
             dc.send(chunk);
           } catch (err) {
-            // Buffer overflow — wait for drain and retry
+            // Buffer overflow — wait for drain and retry once
             await waitForDrain(dc);
             if (!dc || dc.readyState !== 'open') break;
             try {
               dc.send(chunk);
             } catch (err2) {
-              console.error('[DropBeam] send failed after retry', err2.message);
+              clearInterval(progressTimer);
+              transferDone = true;
               updateReceiver(receiverId, { status: 'error', error: 'Send failed' });
+              if (dc) dc.onmessage = null;
               return;
             }
           }
 
           pos += chunk.byteLength;
-          offset += chunk.byteLength;
           globalBytesSent += chunk.byteLength;
           chunksSent++;
 
-          // === BACKPRESSURE: only wait when buffer exceeds HIGH watermark ===
-          // This is the KEY speed optimization — let the buffer fill up to BUF_HI
-          // before pausing, instead of waiting before every single send.
+          // Backpressure — only wait when buffer exceeds HIGH watermark
           if (dc.bufferedAmount > BUF_HI) {
             await waitForDrain(dc);
           }
-
-          // Check pause (but don't await every iteration — only when actually paused)
-          if (pausedRef.current || conn._remotePaused) {
-            await waitIfPaused(pausedRef, destroyedRef, isRemotePaused);
-          }
-
-          // === Speed tracking (use bytes on wire, not bytes in buffer) ===
-          const now = Date.now();
-          senderSpeedSamples.push({ time: now, bytes: globalBytesSent });
-          // Keep only last 3 seconds of samples
-          while (senderSpeedSamples.length > 2 && now - senderSpeedSamples[0].time > 3000) {
-            senderSpeedSamples.shift();
-          }
-          if (senderSpeedSamples.length >= 2) {
-            const oldest = senderSpeedSamples[0];
-            const elapsed = (now - oldest.time) / 1000;
-            if (elapsed > 0) {
-              senderLocalSpeed = (globalBytesSent - oldest.bytes) / elapsed;
-            }
-          }
-
-          // Progress based on bytes confirmed on-wire (subtract what's still buffered)
-          const bytesOnWire = Math.max(0, globalBytesSent - (dc.bufferedAmount || 0));
-          const senderPct = grandTotal > 0 ? Math.min(99, Math.round((bytesOnWire / grandTotal) * 100)) : 0;
-          const remaining = grandTotal - bytesOnWire;
-          const remainingSec = senderLocalSpeed > 0 ? remaining / senderLocalSpeed : 0;
-          const senderEta = senderLocalSpeed > 0 ? formatTime(remainingSec) : '--:--';
-          const senderEtc = senderLocalSpeed > 0
-            ? new Date(Date.now() + remainingSec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
-            : '';
-          const recalcTotalChunks = Math.ceil(grandTotal / currentChunkSize);
-
-          throttledUpdate({
-            bytesSent: bytesOnWire,
-            bytesTotal: grandTotal,
-            senderProgress: senderPct,
-            senderSpeed: senderLocalSpeed,
-            senderEta: senderEta,
-            senderEtc: senderEtc,
-            senderSpeedLabel: getSpeedLabel(senderLocalSpeed),
-            activeChunkSize: currentChunkSize,
-            chunksSent,
-            totalChunks: recalcTotalChunks,
-          });
         }
 
-        // Check cancel after each batch
-        if (conn._cancelled) break;
+        offset += bigView.length;
+
+        // Check pause between batches (not per-chunk)
+        if (pausedRef.current || conn._remotePaused) {
+          await waitIfPaused(pausedRef, destroyedRef, isRemotePaused);
+        }
       }
 
-      // Check cancel before sending file-end
       if (destroyedRef.current || conn._cancelled) break;
+      if (!dc || dc.readyState !== 'open') break;
 
       dcSendJSON(dc, { type: 'file-end', index: fi });
     }
 
-    // === FIX #2: Check cancel BEFORE marking done ===
+    // ===== CLEANUP PROGRESS TIMER =====
+    clearInterval(progressTimer);
+    transferDone = true;
+
+    // Check cancel BEFORE marking done
     if (destroyedRef.current || conn._cancelled) {
-      flushUpdate();
       if (dc) dc.onmessage = null;
-      // Don't overwrite 'cancelled' status if already set
       setReceivers(prev => prev.map(r => {
         if (r.id === receiverId && r.status !== 'cancelled') {
           return { ...r, status: 'disconnected' };
@@ -509,7 +496,7 @@ export function useFileSender() {
       return;
     }
 
-    // Wait for receiver confirmation — but also check cancel during wait
+    // Wait for receiver confirmation
     await new Promise((resolve) => {
       if (receiverBytes >= grandTotal) return resolve();
       const onMsg = (event) => {
@@ -522,7 +509,6 @@ export function useFileSender() {
               clearInterval(cancelCheck);
               resolve();
             }
-            // Also check if cancel arrives during confirmation wait
             if (msg.type === 'cancel') {
               conn._cancelled = true;
               dc.removeEventListener('message', onMsg);
@@ -534,7 +520,6 @@ export function useFileSender() {
         }
       };
       dc.addEventListener('message', onMsg);
-      // Check cancel periodically during wait
       const cancelCheck = setInterval(() => {
         if (conn._cancelled || destroyedRef.current) {
           dc.removeEventListener('message', onMsg);
@@ -543,18 +528,14 @@ export function useFileSender() {
           resolve();
         }
       }, 100);
-      // Dynamic timeout: at least 60s, or 3× the estimated remaining time at minimum 30KB/s
       const remainingBytes = Math.max(0, grandTotal - receiverBytes);
       const dynTimeout = Math.max(60000, Math.ceil((remainingBytes / (30 * 1024)) * 3000));
       const sid = setTimeout(() => { dc.removeEventListener('message', onMsg); clearInterval(cancelCheck); resolve(); }, dynTimeout);
     });
 
-    flushUpdate();
-
-    // Clean up dc.onmessage to release closure references
+    // Clean up
     if (dc) dc.onmessage = null;
 
-    // Check cancel one final time after confirmation
     if (destroyedRef.current || conn._cancelled) {
       setReceivers(prev => prev.map(r => {
         if (r.id === receiverId && r.status !== 'cancelled') {
