@@ -16,9 +16,17 @@ function SendPage({ onTransferStateChange }) {
   const [expiryCountdown, setExpiryCountdown] = useState('');
   const [previewFile, setPreviewFile] = useState(null);
   const [isZipping, setIsZipping] = useState(false);
+  const [completedAt, setCompletedAt] = useState('');
 
   const isActive = status === 'transferring' || status === 'waiting' || receivers.some(r => r.status === 'transferring');
   useEffect(() => { onTransferStateChange?.(isActive); }, [isActive, onTransferStateChange]);
+
+  // Capture completion time once
+  useEffect(() => {
+    if (status === 'done') {
+      setCompletedAt(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }));
+    }
+  }, [status]);
 
   useEffect(() => {
     if (!codeExpiry) { setExpiryCountdown(''); return; }
@@ -332,7 +340,7 @@ function SendPage({ onTransferStateChange }) {
             <div className="complete-section fade-in">
               <div className="complete-icon">✓</div>
               <div className="complete-title">All Transfers Complete</div>
-              <div className="complete-time">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })}</div>
+              {completedAt && <div className="complete-time">Completed at {completedAt}</div>}
               {expiryCountdown && <div className="expiry-badge">Code expires in {expiryCountdown}</div>}
               <button className="btn btn-secondary" onClick={handleSendMore} style={{ marginTop: '1rem' }}>Send more files</button>
             </div>

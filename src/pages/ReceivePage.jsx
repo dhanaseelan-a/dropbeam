@@ -8,6 +8,7 @@ function ReceivePage({ onTransferStateChange }) {
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, activeChunkSize,
     networkMode, speedLabel, remotePaused, paused, togglePause,
+    bytesReceived, bytesTotal,
     connect, cleanup
   } = useFileReceiver();
   const [inputCode, setInputCode] = useState('');
@@ -124,6 +125,7 @@ function ReceivePage({ onTransferStateChange }) {
 
               <div className="transfer-details">
                 {fileList.length > 1 && <div className="file-counter">File {currentFileIndex + 1} of {fileList.length}</div>}
+                <div className="chunk-counter">{formatBytes(bytesReceived)} / {formatBytes(bytesTotal)}</div>
                 <div className="chunk-counter">⏱ {eta} remaining</div>
               </div>
 
