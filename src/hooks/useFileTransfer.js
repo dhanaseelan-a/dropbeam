@@ -2,13 +2,13 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 64 * 1024;        // 64KB — reliable on internet/relay, scales up adaptively
-const MAX_CHUNK  = 256 * 1024;       // Max adaptive chunk size for fast links
-const BUF_HI     = 1 * 1024 * 1024;  // 1MB — lower pressure for internet transfers
-const BUF_LO     = 128 * 1024;       // Resume sooner = less stall time on slow links
-const READ_AHEAD = 8;                // Read 8 chunks at a time — less memory pressure
-const ACK_INTERVAL = 500;            // Receiver ACK interval (ms) — reduced overhead on slow links
-const UI_INTERVAL  = 250;            // Sender UI throttle (ms)
+const CHUNK_SIZE = 128 * 1024;       // 128KB — good starting point, scales up adaptively
+const MAX_CHUNK  = 1024 * 1024;      // 1MB — max adaptive chunk for fast links
+const BUF_HI     = 4 * 1024 * 1024;  // 4MB — keep data channel pipeline full for speed
+const BUF_LO     = 512 * 1024;       // 512KB — resume sending quickly after drain
+const READ_AHEAD = 16;               // Read 16 chunks at a time — fewer disk reads
+const ACK_INTERVAL = 1000;           // Receiver ACK interval (ms) — 1s = less overhead
+const UI_INTERVAL  = 200;            // Sender UI throttle (ms)
 
 const NETWORK_MODES = {
   lan:      { label: 'LAN / Hotspot', icon: '🔌', color: '#22c55e', detail: 'Same network' },
@@ -18,9 +18,9 @@ const NETWORK_MODES = {
 };
 
 const CHUNK_TIERS = {
-  slow:   { size: 64 * 1024,  label: 'Slow',   bufHi: 512 * 1024,      ahead: 4 },
-  normal: { size: 128 * 1024, label: 'Normal', bufHi: 1 * 1024 * 1024, ahead: 8 },
-  fast:   { size: 256 * 1024, label: 'Fast',   bufHi: 2 * 1024 * 1024, ahead: 16 },
+  slow:   { size: 128 * 1024,  label: 'Slow',   bufHi: 1 * 1024 * 1024,  ahead: 8 },
+  normal: { size: 256 * 1024,  label: 'Normal', bufHi: 2 * 1024 * 1024,  ahead: 16 },
+  fast:   { size: 1024 * 1024, label: 'Fast',   bufHi: 4 * 1024 * 1024,  ahead: 32 },
 };
 
 // ===== ADAPTIVE CHUNK SIZING =====
@@ -28,9 +28,10 @@ const CHUNK_TIERS = {
 function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
-  if (kbps < 200) return 64 * 1024;     // <200 KB/s → 64KB chunks
-  if (kbps < 1024) return 128 * 1024;   // <1 MB/s → 128KB chunks
-  return MAX_CHUNK;                      // ≥1 MB/s → 256KB chunks
+  if (kbps < 200) return 128 * 1024;    // <200 KB/s → 128KB chunks
+  if (kbps < 500) return 256 * 1024;    // <500 KB/s → 256KB chunks
+  if (kbps < 2048) return 512 * 1024;   // <2 MB/s → 512KB chunks
+  return MAX_CHUNK;                      // ≥2 MB/s → 1MB chunks
 }
 
 // ===== SPEED LABEL =====
@@ -190,10 +191,10 @@ function waitForDrain(dc) {
     const onLow = () => done();
     dc.addEventListener('bufferedamountlow', onLow);
 
-    // Safety poll every 50ms — some browsers don't fire the event reliably
+    // Safety poll every 20ms — some browsers don't fire the event reliably
     const pollId = setInterval(() => {
       if (!dc || dc.readyState !== 'open' || dc.bufferedAmount <= BUF_LO) done();
-    }, 50);
+    }, 20);
   });
 }
 
@@ -328,6 +329,7 @@ export function useFileSender() {
     };
 
     let currentChunkSize = CHUNK_SIZE;
+    let lastSentChunkSize = currentChunkSize; // Track to detect changes
     let chunksSent = 0;
     const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
     const startTime = Date.now();
@@ -344,7 +346,7 @@ export function useFileSender() {
       type: 'file-list',
       files: filesToSend.map(f => ({ name: f.name, size: f.size, fileType: f.type })),
       device: getDeviceName(),
-      chunkSize: CHUNK_SIZE
+      chunkSize: currentChunkSize
     });
 
     for (let fi = 0; fi < filesToSend.length; fi++) {
@@ -367,6 +369,11 @@ export function useFileSender() {
         // Adaptive chunk sizing based on current speed
         if (senderLocalSpeed > 0) {
           currentChunkSize = getAdaptiveChunk(senderLocalSpeed);
+          // Notify receiver when chunk size changes so UI stays in sync
+          if (currentChunkSize !== lastSentChunkSize) {
+            lastSentChunkSize = currentChunkSize;
+            dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
+          }
         }
 
         // Read a batch of chunks from disk
@@ -876,6 +883,7 @@ export function useFileReceiver() {
 
       case 'tier-update':
       case 'config-update':
+      case 'chunk-update':
         if (msg.chunkSize) setActiveChunkSize(msg.chunkSize);
         break;
 
