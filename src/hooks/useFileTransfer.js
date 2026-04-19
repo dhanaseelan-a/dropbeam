@@ -2,11 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 128 * 1024;        // 128KB — Large initial chunk for maximum SCTP pipeline efficiency
-const MAX_CHUNK  = 256 * 1024;        // 256KB — Safe max for all browsers/SCTP implementations
-const BUF_HI     = 2 * 1024 * 1024;   // 2MB — High watermark: keeps SCTP congestion window well-fed
-const BUF_LO     = 256 * 1024;        // 256KB — Low watermark: resume quickly without buffer starvation
-const READ_AHEAD = 8;                 // Read 8 chunks at a time (128KB × 8 = 1MB batch)
+const CHUNK_SIZE = 64 * 1024;         // 64KB — Safe for all networks (prevent TURN fragmentation)
+const MAX_CHUNK  = 256 * 1024;        // 256KB — Max for incredibly fast connections
+const BUF_HI     = 4 * 1024 * 1024;   // 4MB — High watermark: large SCTP congestion window
+const BUF_LO     = 512 * 1024;        // 512KB — Low watermark: resume quickly
+const READ_AHEAD = 16;                // Read 16 chunks at a time (64KB × 16 = 1MB batch)
 const ACK_INTERVAL = 200;             // Receiver ACK interval (ms)
 const UI_INTERVAL  = 200;             // Sender UI throttle (ms)
 
@@ -25,13 +25,12 @@ const CHUNK_TIERS = {
 
 // ===== ADAPTIVE CHUNK SIZING =====
 // Dynamically scales chunk size based on true network speed.
-// CRITICAL: Only scales UP from CHUNK_SIZE. Never downgrades — smaller chunks
-// cause more per-message SCTP overhead which creates a speed death spiral.
 function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
-  if (kbps < 2000) return CHUNK_SIZE;      // Keep 128KB — never downgrade below initial
-  return MAX_CHUNK;                        // >=2 MB/s → 256KB
+  if (kbps < 1000) return CHUNK_SIZE;      // < 1 MB/s
+  if (kbps < 3000) return 128 * 1024;      // 1-3 MB/s
+  return MAX_CHUNK;                        // > 3 MB/s
 }
 
 // ===== SPEED LABEL =====
@@ -269,6 +268,7 @@ export function useFileSender() {
     let chunksSent = 0;
     let currentChunkSize = CHUNK_SIZE;
     let lastSentChunkSize = currentChunkSize;
+    let maxAllowedChunkSize = MAX_CHUNK;
     let receiverBytes = 0;
     let currentSpeed = 0;
     let transferDone = false; // flag to stop the progress timer
@@ -285,7 +285,7 @@ export function useFileSender() {
           if (msg.type === 'ack') {
             if (msg.received != null) receiverBytes = Math.max(receiverBytes, msg.received);
             // Forward receiver's progress/speed to UI
-            const updObj = { progress: msg.progress ?? 0, eta: msg.eta || '' };
+            const updObj = { progress: msg.progress ?? 0, eta: msg.eta || '', etc: msg.etc || '' };
             if (msg.speed > 0) {
               updObj.speed = msg.speed;
               updObj.speedLabel = getSpeedLabel(msg.speed);
@@ -327,7 +327,7 @@ export function useFileSender() {
 
       // Adaptive Check -> use the 'currentSpeed' harvested from receiver ACKs!
       if (currentSpeed > 0) {
-        const nextChunkSize = getAdaptiveChunk(currentSpeed);
+        const nextChunkSize = Math.min(getAdaptiveChunk(currentSpeed), maxAllowedChunkSize);
         if (nextChunkSize !== lastSentChunkSize) {
           lastSentChunkSize = nextChunkSize;
           currentChunkSize = nextChunkSize;
@@ -403,6 +403,7 @@ export function useFileSender() {
             if (err.name === 'TypeError' || String(err).includes('too large')) {
                // Browser rejected message size — step down chunk permanently
                currentChunkSize = Math.max(16 * 1024, Math.floor(currentChunkSize / 2));
+               maxAllowedChunkSize = currentChunkSize;
                lastSentChunkSize = currentChunkSize;
                dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
                end = Math.min(pos + currentChunkSize, bigView.length);
@@ -465,38 +466,50 @@ export function useFileSender() {
     // Wait for receiver confirmation
     await new Promise((resolve) => {
       if (receiverBytes >= grandTotal) return resolve();
+      
+      const finish = () => {
+        dc.removeEventListener('message', onMsg);
+        clearInterval(cancelCheck);
+        resolve();
+      };
+
       const onMsg = (event) => {
         if (typeof event.data === 'string') {
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === 'ack' && msg.received >= grandTotal) {
-              dc.removeEventListener('message', onMsg);
-              clearTimeout(sid);
-              clearInterval(cancelCheck);
-              resolve();
+              finish();
             }
             if (msg.type === 'cancel') {
               conn._cancelled = true;
-              dc.removeEventListener('message', onMsg);
-              clearTimeout(sid);
-              clearInterval(cancelCheck);
-              resolve();
+              finish();
             }
           } catch (e) {}
         }
       };
+      
       dc.addEventListener('message', onMsg);
+      
+      let lastRecv = receiverBytes;
+      let idleTime = 0;
+      
       const cancelCheck = setInterval(() => {
-        if (conn._cancelled || destroyedRef.current) {
-          dc.removeEventListener('message', onMsg);
-          clearTimeout(sid);
-          clearInterval(cancelCheck);
-          resolve();
+        if (conn._cancelled || destroyedRef.current || !dc || dc.readyState !== 'open') {
+          finish();
+          return;
         }
-      }, 100);
-      const remainingBytes = Math.max(0, grandTotal - receiverBytes);
-      const dynTimeout = Math.max(60000, Math.ceil((remainingBytes / (30 * 1024)) * 3000));
-      const sid = setTimeout(() => { dc.removeEventListener('message', onMsg); clearInterval(cancelCheck); resolve(); }, dynTimeout);
+        
+        if (receiverBytes > lastRecv) {
+          lastRecv = receiverBytes;
+          idleTime = 0;
+        } else if (!pausedRef.current && !conn._remotePaused) {
+          idleTime += 500;
+        }
+        
+        if (idleTime > 60000) { // 60s idle timeout
+          finish();
+        }
+      }, 500);
     });
 
     // Clean up
@@ -793,7 +806,7 @@ export function useFileReceiver() {
     try {
       dc.send(JSON.stringify({
         type: 'ack', progress: pct,
-        received: received, speed: spd, eta: etaStr
+        received: received, speed: spd, eta: etaStr, etc: etcStr
       }));
     } catch (e) {}
   }, [scheduleUI]);
