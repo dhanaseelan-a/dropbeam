@@ -400,8 +400,8 @@ export function useFileSender() {
             pausedRef.current
           ) {
             if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
-            // Short yield to event loop while waiting for ACKs to reduce globalBytesSent - receiverBytes
-            await new Promise(r => setTimeout(r, 50)); 
+            // Immediate yield to event loop while waiting for ACKs 
+            await new Promise(r => setTimeout(r, 5)); 
           }
           if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
 
@@ -726,6 +726,7 @@ export function useFileReceiver() {
   const speedSamplesRef = useRef([]);
   const lastSpeedRef = useRef(0);
   const lastEtaRef = useRef('--:--');
+  const lastAckBytesRef = useRef(0); // Byte-based ACK trigger for max speed
   // Track if we've sent the first ACK (send immediately on first data)
   const firstDataRef = useRef(true);
 
@@ -840,6 +841,7 @@ export function useFileReceiver() {
     grandTotalRef.current = 0;
     speedSamplesRef.current = [];
     chunksReceivedRef.current = 0;
+    lastAckBytesRef.current = 0;
   }, []);
 
   // ---- PROCESS FILE CHUNK (hot path) ----
@@ -867,9 +869,17 @@ export function useFileReceiver() {
     grandReceivedRef.current += data.byteLength;
     chunksReceivedRef.current += 1;
 
+    // Send ACK immediately if we crossed a 256KB threshold, 
+    // entirely bypassing Chrome's rigid 1-second 'background tab' setInterval throttle!
+    if (grandReceivedRef.current - lastAckBytesRef.current >= 256 * 1024) {
+      lastAckBytesRef.current = grandReceivedRef.current;
+      sendAckNow();
+    }
+
     // On FIRST data chunk, send an immediate ACK so sender UI doesn't show 0 B
     if (firstDataRef.current) {
       firstDataRef.current = false;
+      lastAckBytesRef.current = grandReceivedRef.current;
       sendAckNow();
     }
   }, [sendAckNow]);
@@ -892,6 +902,7 @@ export function useFileReceiver() {
         startTimeRef.current = Date.now();
         speedSamplesRef.current = [{ time: Date.now(), bytes: 0 }];
         firstDataRef.current = true;
+        lastAckBytesRef.current = 0;
         setStatus('receiving');
         startAckTimer();
         break;
