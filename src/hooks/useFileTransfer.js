@@ -107,19 +107,9 @@ function playDone() {
 }
 
 const ICE = [
-  // STUN — discover public IP for NAT traversal
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' },
   { urls: 'stun:stun.cloudflare.com:3478' },
-  // TURN — CRITICAL for internet transfers when both peers are behind symmetric NATs.
-  // Without TURN, PeerJS falls back to its slow relay (~56KB/s cap).
-  { urls: 'turn:openrelay.metered.ca:80',                username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443',               username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
 function getDC(conn) {
@@ -272,6 +262,7 @@ export function useFileSender() {
     let currentSpeed = 0;
     let inFlightBytes = 0;
     let transferDone = false; // flag to stop the progress timer
+    let lastAckTime = Date.now();
 
     // Remote pause flag
     conn._remotePaused = false;
@@ -283,6 +274,7 @@ export function useFileSender() {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'ack') {
+            lastAckTime = Date.now();
             if (msg.received != null) {
               receiverBytes = Math.max(receiverBytes, msg.received);
               inFlightBytes = globalBytesSent - receiverBytes;
@@ -317,6 +309,36 @@ export function useFileSender() {
         } catch (e) {}
       }
     };
+
+    // ===== STUCK DETECTOR WATCHDOG =====
+    const watchdog = setInterval(() => {
+      if (transferDone || destroyedRef.current || conn._cancelled) {
+         clearInterval(watchdog);
+         return;
+      }
+      if (Date.now() - lastAckTime > 5000 && dc.bufferedAmount > 0 && !pausedRef.current && !conn._remotePaused) {
+        console.log("[DropBeam] Stuck detected → reconnecting sender full stack");
+        
+        // SENDER CLEANUP AND STATE TEARDOWN
+        conn._restarting = true;
+        isPumping = false;
+        if (dc) {
+           dc.onmessage = null;
+           dc.onbufferedamountlow = null;
+        }
+        clearInterval(progressTimer);
+        clearInterval(watchdog);
+        
+        conn.close();
+        
+        // Force bidirectional recovery
+        setTimeout(() => {
+          if (!destroyedRef.current && peerRef.current) {
+            initPeer(peerRef.current.id);
+          }
+        }, 1000);
+      }
+    }, 3000);
 
     // ===== PROGRESS TIMER — runs every 200ms =====
     // We strictly use receiver ACKs for speed, avoiding local dc.bufferedAmount glitches 
@@ -555,7 +577,7 @@ export function useFileSender() {
   }, [updateReceiver]);
 
   // ---- PEER SETUP ----
-  const initPeer = useCallback(() => {
+  const initPeer = useCallback((existingCode = null) => {
     if (peerRef.current) peerRef.current.destroy();
     destroyedRef.current = false;
     setReceivers([]);
@@ -563,7 +585,7 @@ export function useFileSender() {
     setPaused(false);
     if (expiryRef.current) clearTimeout(expiryRef.current);
 
-    const myCode = generateCode();
+    const myCode = existingCode || generateCode();
     const peer = new Peer(myCode, {
       config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
       debug: 0
@@ -629,6 +651,10 @@ export function useFileSender() {
                     updateReceiver(receiverId, { device: msg.device || '' });
                     dc.removeEventListener('message', onFirstMsg);
                     
+                    // Resume lock to prevent duplicate transfers
+                    if (conn._restarting) return;
+                    conn._restarting = true;
+                    
                     // If the device re-connected, scrub any matching old receiver to prevent ghost UI elements
                     setReceivers(prev => {
                        const exists = prev.some(r => r.id !== receiverId && r.status === 'disconnected' && r.device === msg.device);
@@ -642,6 +668,21 @@ export function useFileSender() {
              }
           };
           dc.addEventListener('message', onFirstMsg);
+        }
+
+        const pc = conn.peerConnection || conn._pc;
+        if (pc) {
+          pc.addEventListener('iceconnectionstatechange', () => {
+             const state = pc.iceConnectionState;
+             if (state === 'failed' || state === 'disconnected') {
+                console.log("[DropBeam] Sender ICE State:", state);
+                if (state === 'failed') {
+                   conn.close(); // Force watchdog full reconnect
+                } else {
+                   try { pc.restartIce(); } catch(e) {}
+                }
+             }
+          });
         }
       });
 
@@ -1105,10 +1146,16 @@ export function useFileReceiver() {
           peer.peerConnection.addEventListener('iceconnectionstatechange', () => {
              const state = peer.peerConnection.iceConnectionState;
              if ((state === 'disconnected' || state === 'failed') && !destroyedRef.current && statusRef.current !== 'done') {
-                stopAckTimer();
-                setRemotePaused(false);
-                setPaused(false);
-                setStatus('reconnecting');
+                console.log("[DropBeam] Receiver ICE State:", state);
+                if (state === 'failed') {
+                   conn.close(); // Force native 3s reconnect loops
+                } else {
+                   try { peer.peerConnection.restartIce(); } catch(e) {}
+                   stopAckTimer();
+                   setRemotePaused(false);
+                   setPaused(false);
+                   setStatus('reconnecting');
+                }
              }
           });
         }
