@@ -2,12 +2,12 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 128 * 1024;        // 128KB — Standard size, adaptive step down if needed
-const MAX_CHUNK  = 256 * 1024;        // 256KB — Max for incredibly fast connections
-const BUF_HI     = 1 * 1024 * 1024;   // 1MB — High watermark: responsive pause button
-const BUF_LO     = 256 * 1024;        // 256KB — Low watermark: resume quickly
-const READ_AHEAD = 8;                 // Read 8 chunks at a time (128KB × 8 = 1MB batch)
-const ACK_INTERVAL = 200;             // Receiver ACK interval (ms)
+const CHUNK_SIZE = 256 * 1024;        // 256KB — Fixed max for maximum throughput (auto steps down if rejected)
+const MAX_CHUNK  = 256 * 1024;        // 256KB limit
+const BUF_HI     = 8 * 1024 * 1024;   // 8MB — Maximize SCTP Congestion Window for 500Mbps+ WiFi
+const BUF_LO     = 2 * 1024 * 1024;   // 2MB — Low watermark
+const READ_AHEAD = 16;                // Read 4MB from disk at a time (256KB × 16)
+const ACK_INTERVAL = 200;             // Receiver ACK fallback interval (ms)
 const UI_INTERVAL  = 200;             // Sender UI throttle (ms)
 
 const NETWORK_MODES = {
@@ -392,9 +392,9 @@ export function useFileSender() {
           if (!dc || dc.readyState !== 'open') break;
 
           // 1. Application-Level Backpressure & Pause
-          // Hides network jitter up to 4MB in-flight. Blocks instantly on pause.
+          // Raised to 12MB to saturate gigabit WiFi connections natively while keeping states synced
           while (
-            globalBytesSent - receiverBytes > 4 * 1024 * 1024 || 
+            globalBytesSent - receiverBytes > 12 * 1024 * 1024 || 
             conn._remotePaused ||
             pausedRef.current
           ) {
@@ -732,6 +732,7 @@ export function useFileReceiver() {
   const lastSpeedRef = useRef(0);
   const lastEtaRef = useRef('--:--');
   const lastAckBytesRef = useRef(0); // Byte-based ACK trigger for max speed
+  const lastAckTimeRef = useRef(0);  // Prevent ACK spam at Gigabit speeds
   // Track if we've sent the first ACK (send immediately on first data)
   const firstDataRef = useRef(true);
 
@@ -784,11 +785,15 @@ export function useFileReceiver() {
   }, []);
 
   // ---- COMPUTE SPEED + SEND ACK ----
-  const sendAckNow = useCallback(() => {
+  const sendAckNow = useCallback((force = false) => {
     const dc = dcRef.current;
     if (!dc || dc.readyState !== 'open') return;
 
     const now = Date.now();
+    // Throttle ACK JSON spam to max ~30 times a second at extreme 50+ MB/s Wi-Fi speeds
+    if (!force && now - lastAckTimeRef.current < 33) return;
+    lastAckTimeRef.current = now;
+
     const received = grandReceivedRef.current;
     const total = grandTotalRef.current;
 
@@ -878,14 +883,14 @@ export function useFileReceiver() {
     // entirely bypassing Chrome's rigid 1-second 'background tab' setInterval throttle!
     if (grandReceivedRef.current - lastAckBytesRef.current >= 256 * 1024) {
       lastAckBytesRef.current = grandReceivedRef.current;
-      sendAckNow();
+      sendAckNow(false);
     }
 
     // On FIRST data chunk, send an immediate ACK so sender UI doesn't show 0 B
     if (firstDataRef.current) {
       firstDataRef.current = false;
       lastAckBytesRef.current = grandReceivedRef.current;
-      sendAckNow();
+      sendAckNow(true);
     }
   }, [sendAckNow]);
 
@@ -959,7 +964,7 @@ export function useFileReceiver() {
       }
 
       case 'all-done': {
-        sendAckNow();
+        sendAckNow(true);
         stopAckTimer();
         const tt = (Date.now() - startTimeRef.current) / 1000;
         const avgSpd = grandReceivedRef.current / tt;
