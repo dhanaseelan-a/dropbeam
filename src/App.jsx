@@ -59,7 +59,7 @@ function App() {
           <span>WebRTC</span>
         </div>
         <div className="footer-text" style={{ marginTop: '0.75rem', opacity: 0.8, fontSize: '0.85rem' }}>
-          Created by dhanaseelan
+          <span className="typewriter">Created by Dhanaseelan ❤️</span>
         </div>
       </footer>
     </div>
