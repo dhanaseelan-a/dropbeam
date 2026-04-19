@@ -58,6 +58,9 @@ function App() {
           <span className="footer-dot"></span>
           <span>WebRTC</span>
         </div>
+        <div className="footer-text" style={{ marginTop: '0.75rem', opacity: 0.8, fontSize: '0.85rem' }}>
+          Created by dhanaseelan
+        </div>
       </footer>
     </div>
   );

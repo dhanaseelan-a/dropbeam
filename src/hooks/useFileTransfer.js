@@ -338,10 +338,35 @@ export function useFileSender() {
         
         conn.close();
         
-        // Force bidirectional recovery with extended padding
+        // Force bidirectional recovery with extended padding (new ID generates safely)
         setTimeout(() => {
-          if (!destroyedRef.current && peerRef.current) {
-            initPeer(peerRef.current.id);
+          if (!destroyedRef.current) {
+            initPeer();
+          }
+        }, 1500);
+      } else if (Date.now() - lastAckTime > 10000 && !pausedRef.current && !conn._remotePaused) {
+        // Hard timeout safety (independent of bufferedAmount)
+        if (Date.now() - lastRestartRef.current < 5000) return;
+        lastRestartRef.current = Date.now();
+        console.log("[DropBeam] Hard timeout → reconnecting");
+        
+        conn._restarting = true;
+        isPumping = false;
+        if (dc) {
+           dc.onmessage = null;
+           if (dc._pumpHandler) {
+               dc.removeEventListener('bufferedamountlow', dc._pumpHandler);
+               dc._pumpHandler = null;
+           }
+        }
+        if (progressTimer) clearInterval(progressTimer);
+        clearInterval(watchdog);
+        
+        conn.close();
+        
+        setTimeout(() => {
+          if (!destroyedRef.current) {
+            initPeer();
           }
         }, 1500);
       }
