@@ -564,7 +564,7 @@ export function useFileSender() {
 
     const myCode = generateCode();
     const peer = new Peer(myCode, {
-      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10, bundlePolicy: 'max-bundle' },
+      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
       debug: 0
     });
 
@@ -1028,7 +1028,7 @@ export function useFileReceiver() {
     setPaused(false);
 
     const peer = new Peer({
-      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10, bundlePolicy: 'max-bundle' },
+      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
       debug: 0
     });
 
