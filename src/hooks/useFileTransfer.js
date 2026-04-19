@@ -270,6 +270,7 @@ export function useFileSender() {
     let maxAllowedChunkSize = MAX_CHUNK;
     let receiverBytes = 0;
     let currentSpeed = 0;
+    let inFlightBytes = 0;
     let transferDone = false; // flag to stop the progress timer
 
     // Remote pause flag
@@ -282,7 +283,10 @@ export function useFileSender() {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'ack') {
-            if (msg.received != null) receiverBytes = Math.max(receiverBytes, msg.received);
+            if (msg.received != null) {
+              receiverBytes = Math.max(receiverBytes, msg.received);
+              inFlightBytes = globalBytesSent - receiverBytes;
+            }
             // Forward receiver's progress/speed to UI
             const updObj = { progress: msg.progress ?? 0, eta: msg.eta || '', etc: msg.etc || '' };
             if (msg.speed > 0) {
@@ -316,11 +320,9 @@ export function useFileSender() {
     // that falsely reported 0 B/s on fast connections.
     const progressTimer = setInterval(() => {
       if (transferDone) return;
-      const now = Date.now();
-
-      // We only compute immediate display progress (bytes sent locally).
-      // Speed and ETA are exclusively calculated by the Receiver's ACKs to avoid 0B glitches.
-      const displayBytes = globalBytesSent;
+      
+      // Use receiverBytes for display to ensure perfect sync between Sender and Receiver pages
+      const displayBytes = receiverBytes;
       const pct = grandTotal > 0 ? Math.min(99, Math.round((displayBytes / grandTotal) * 100)) : 0;
       const totalChunks = Math.ceil(grandTotal / CHUNK_SIZE);
 
@@ -384,12 +386,19 @@ export function useFileSender() {
         const bigView = new Uint8Array(bigBuf);
 
         // ===== HOT INNER LOOP — minimal overhead =====
-        // Only: send, increment counters, backpressure check
-        // NO speed tracking, NO formatting, NO object creation
         let pos = 0;
         while (pos < bigView.length) {
           if (destroyedRef.current || conn._cancelled) break;
           if (!dc || dc.readyState !== 'open') break;
+
+          // CRITICAL APPLICATION-LEVEL BACKPRESSURE 
+          // Do not send if WebRTC buffer is full OR if receiver is lagging more than 4MB behind!
+          while (globalBytesSent - receiverBytes > 4 * 1024 * 1024 || dc.bufferedAmount > BUF_HI) {
+            if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
+            // Short yield to event loop while waiting for ACKs to reduce globalBytesSent - receiverBytes
+            await new Promise(r => setTimeout(r, 20)); 
+          }
+          if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
 
           let end = Math.min(pos + currentChunkSize, bigView.length);
           // subarray = zero-copy view (no allocation)
@@ -424,12 +433,8 @@ export function useFileSender() {
 
           pos += chunk.byteLength;
           globalBytesSent += chunk.byteLength;
+          inFlightBytes = globalBytesSent - receiverBytes;
           chunksSent++;
-          
-          // Backpressure — only wait when buffer exceeds HIGH watermark
-          if (dc.bufferedAmount > BUF_HI) {
-            await waitForDrain(dc);
-          }
         }
 
         offset += bigView.length;
