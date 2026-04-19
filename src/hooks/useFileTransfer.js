@@ -2,11 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 // ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 64 * 1024;         // 64KB — Safe for all networks (prevent TURN fragmentation)
+const CHUNK_SIZE = 128 * 1024;        // 128KB — Standard size, adaptive step down if needed
 const MAX_CHUNK  = 256 * 1024;        // 256KB — Max for incredibly fast connections
-const BUF_HI     = 4 * 1024 * 1024;   // 4MB — High watermark: large SCTP congestion window
-const BUF_LO     = 512 * 1024;        // 512KB — Low watermark: resume quickly
-const READ_AHEAD = 16;                // Read 16 chunks at a time (64KB × 16 = 1MB batch)
+const BUF_HI     = 1 * 1024 * 1024;   // 1MB — High watermark: responsive pause button
+const BUF_LO     = 256 * 1024;        // 256KB — Low watermark: resume quickly
+const READ_AHEAD = 8;                 // Read 8 chunks at a time (128KB × 8 = 1MB batch)
 const ACK_INTERVAL = 200;             // Receiver ACK interval (ms)
 const UI_INTERVAL  = 200;             // Sender UI throttle (ms)
 
@@ -28,9 +28,8 @@ const CHUNK_TIERS = {
 function getAdaptiveChunk(bytesPerSec) {
   if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
   const kbps = bytesPerSec / 1024;
-  if (kbps < 1000) return CHUNK_SIZE;      // < 1 MB/s
-  if (kbps < 3000) return 128 * 1024;      // 1-3 MB/s
-  return MAX_CHUNK;                        // > 3 MB/s
+  if (kbps < 2000) return CHUNK_SIZE;      // < 2 MB/s
+  return MAX_CHUNK;                        // > 2 MB/s
 }
 
 // ===== SPEED LABEL =====
@@ -698,6 +697,7 @@ export function useFileReceiver() {
   const dcRef = useRef(null);
 
   const fileBufferRef = useRef(null);
+  const blobPartsRef = useRef([]);
   const fileOffsetRef = useRef(0);
   const chunksRef = useRef([]);
   const fileTypeRef = useRef('');
@@ -823,6 +823,7 @@ export function useFileReceiver() {
   // ---- Free all receive buffers ----
   const freeBuffers = useCallback(() => {
     fileBufferRef.current = null;
+    blobPartsRef.current = [];
     fileOffsetRef.current = 0;
     chunksRef.current = [];
     grandReceivedRef.current = 0;
@@ -846,6 +847,11 @@ export function useFileReceiver() {
       }
     } else {
       chunksRef.current.push(data instanceof ArrayBuffer ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+      // Flush to Blob to prevent V8 Out-Of-Memory limit crash (~1.4GB)
+      if (chunksRef.current.length >= 256) {
+        blobPartsRef.current.push(new Blob(chunksRef.current, { type: fileTypeRef.current }));
+        chunksRef.current = [];
+      }
     }
 
     grandReceivedRef.current += data.byteLength;
@@ -892,6 +898,7 @@ export function useFileReceiver() {
         fileTypeRef.current = msg.fileType || 'application/octet-stream';
         fileNameRef.current = msg.name;
         fileBufferRef.current = null;
+        blobPartsRef.current = [];
         fileOffsetRef.current = 0;
         chunksRef.current = [];
         const MAX_PREALLOC = 512 * 1024 * 1024;
@@ -906,10 +913,11 @@ export function useFileReceiver() {
         let blob;
         if (fileBufferRef.current) {
           blob = new Blob([fileBufferRef.current.subarray(0, fileOffsetRef.current)], { type: fileTypeRef.current });
-        } else if (chunksRef.current.length > 0) {
-          blob = new Blob(chunksRef.current, { type: fileTypeRef.current });
         } else {
-          blob = new Blob([], { type: fileTypeRef.current });
+          if (chunksRef.current.length > 0) {
+            blobPartsRef.current.push(new Blob(chunksRef.current, { type: fileTypeRef.current }));
+          }
+          blob = new Blob(blobPartsRef.current, { type: fileTypeRef.current });
         }
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -918,6 +926,7 @@ export function useFileReceiver() {
         setTimeout(() => URL.revokeObjectURL(url), 10000);
         // Free file buffers immediately after saving
         fileBufferRef.current = null;
+        blobPartsRef.current = [];
         fileOffsetRef.current = 0;
         chunksRef.current = [];
         break;
