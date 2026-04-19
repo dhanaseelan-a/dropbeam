@@ -252,8 +252,8 @@ export function useFileSender() {
     });
   }, []);
 
-  // ---- TRANSFER ENGINE (rewritten for speed) ----
-  const transferToReceiver = useCallback(async (receiverId, conn, filesToSend) => {
+  // ---- TRANSFER ENGINE (rewritten for event-driven speed & auto-resume) ----
+  const transferToReceiver = useCallback(async (receiverId, conn, filesToSend, startIndex = 0, startOffset = 0) => {
     const dc = getDC(conn);
     if (!dc || dc.readyState !== 'open') {
       updateReceiver(receiverId, { status: 'error', error: 'Channel not open' });
@@ -263,12 +263,12 @@ export function useFileSender() {
 
     const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
     const startTime = Date.now();
-    let globalBytesSent = 0;
+    let globalBytesSent = filesToSend.slice(0, startIndex).reduce((s, f) => s + f.size, 0) + startOffset;
     let chunksSent = 0;
     let currentChunkSize = CHUNK_SIZE;
     let lastSentChunkSize = currentChunkSize;
     let maxAllowedChunkSize = MAX_CHUNK;
-    let receiverBytes = 0;
+    let receiverBytes = globalBytesSent;
     let currentSpeed = 0;
     let inFlightBytes = 0;
     let transferDone = false; // flag to stop the progress timer
@@ -310,6 +310,9 @@ export function useFileSender() {
           }
           if (msg.type === 'device-info') {
             updateReceiver(receiverId, { device: msg.device || '' });
+            if (msg.resumeIndex !== undefined && (msg.resumeOffset > 0 || msg.resumeIndex > 0)) {
+               // Ignore as it is handled by the connection open wrapper now
+            }
           }
         } catch (e) {}
       }
@@ -360,197 +363,195 @@ export function useFileSender() {
       chunkSize: currentChunkSize
     });
 
-    // ===== FILE SEND LOOP =====
-    const isRemotePaused = () => !!conn._remotePaused;
+    // ===== EVENT-DRIVEN FILE PUMP ENGINE =====
+    let fi = startIndex;
+    let offset = startOffset;
+    let batchView = null;
+    let batchPos = 0;
+    let isPumping = false;
 
-    for (let fi = 0; fi < filesToSend.length; fi++) {
-      if (destroyedRef.current || conn._cancelled) break;
-      const file = filesToSend[fi];
-      updateReceiver(receiverId, { currentFile: fi });
+    const startFinishWait = async () => {
+      // ===== CLEANUP PROGRESS TIMER =====
+      clearInterval(progressTimer);
+      transferDone = true;
 
-      dcSendJSON(dc, { type: 'file-start', index: fi, name: file.name, size: file.size, fileType: file.type });
-
-      let offset = 0;
-
-      while (offset < file.size) {
-        if (destroyedRef.current || conn._cancelled) break;
-        if (!dc || dc.readyState !== 'open') break;
-
-        await waitIfPaused(pausedRef, destroyedRef, isRemotePaused);
-        if (destroyedRef.current || conn._cancelled) break;
-
-        // Read a large batch from disk
-        const batchBytes = currentChunkSize * READ_AHEAD;
-        const batchEnd = Math.min(offset + batchBytes, file.size);
-        const bigBuf = await file.slice(offset, batchEnd).arrayBuffer();
-        const bigView = new Uint8Array(bigBuf);
-
-        // ===== HOT INNER LOOP — minimal overhead =====
-        let pos = 0;
-        while (pos < bigView.length) {
-          if (destroyedRef.current || conn._cancelled) break;
-          if (!dc || dc.readyState !== 'open') break;
-
-          // 1. Application-Level Backpressure & Pause
-          // Raised to 12MB to saturate gigabit WiFi connections natively while keeping states synced
-          while (
-            globalBytesSent - receiverBytes > 12 * 1024 * 1024 || 
-            conn._remotePaused ||
-            pausedRef.current
-          ) {
-            if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
-            await new Promise(r => setTimeout(r, 50)); 
+      // Check cancel BEFORE marking done
+      if (destroyedRef.current || conn._cancelled) {
+        if (dc) dc.onmessage = null;
+        setReceivers(prev => prev.map(r => {
+          if (r.id === receiverId && r.status !== 'cancelled') {
+            return { ...r, status: 'disconnected' };
           }
-          if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
+          return r;
+        }));
+        return;
+      }
 
-          // 2. WebRTC Socket Hardware Backpressure 
-          // Uses instantaneous event-driven wakeups (bufferedamountlow) for max throughput.
+      // Wait for receiver confirmation
+      await new Promise((resolve) => {
+        if (receiverBytes >= grandTotal) return resolve();
+        
+        const finish = () => {
+          dc.removeEventListener('message', onMsg);
+          clearInterval(cancelCheck);
+          resolve();
+        };
+
+        const onMsg = (event) => {
+          if (typeof event.data === 'string') {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'ack' && msg.received >= grandTotal) {
+                finish();
+              }
+              if (msg.type === 'cancel') {
+                conn._cancelled = true;
+                finish();
+              }
+            } catch (e) {}
+          }
+        };
+        
+        dc.addEventListener('message', onMsg);
+        
+        let lastRecv = receiverBytes;
+        let idleTime = 0;
+        
+        const cancelCheck = setInterval(() => {
+          if (conn._cancelled || destroyedRef.current || !dc || dc.readyState !== 'open') {
+            finish();
+            return;
+          }
+          
+          if (receiverBytes > lastRecv) {
+            lastRecv = receiverBytes;
+            idleTime = 0;
+          } else if (!pausedRef.current && !conn._remotePaused) {
+            idleTime += 500;
+          }
+          
+          if (idleTime > 60000) { // 60s idle timeout
+            finish();
+          }
+        }, 500);
+      });
+      
+      // Clean up
+      if (dc) dc.onmessage = null;
+
+      if (destroyedRef.current || conn._cancelled) {
+        setReceivers(prev => prev.map(r => {
+          if (r.id === receiverId && r.status !== 'cancelled') {
+            return { ...r, status: 'disconnected' };
+          }
+          return r;
+        }));
+        return;
+      }
+
+      dcSendJSON(dc, { type: 'all-done' });
+
+      const totalTime = (Date.now() - startTime) / 1000;
+      const completionTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+      updateReceiver(receiverId, {
+        status: 'done', progress: 100,
+        avgSpeed: grandTotal / totalTime,
+        totalTime, totalBytes: grandTotal,
+        speedLabel: getSpeedLabel(grandTotal / totalTime),
+        completionTime,
+      });
+      playDone();
+    }; // End of startFinishWait
+
+    // THE EVENT-DRIVEN PUMP TASK
+    const pumpData = async () => {
+      if (isPumping) return;
+      isPumping = true;
+      try {
+        while (true) {
+          if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') return;
+
+          if (fi >= filesToSend.length) {
+            return; // Loop completely finished
+          }
+
+          const file = filesToSend[fi];
+
+          // Application-Level Backpressure & Pause
+          if (globalBytesSent - receiverBytes > 12 * 1024 * 1024 || conn._remotePaused || pausedRef.current) {
+             setTimeout(pumpData, 50); // Yield and poll safely
+             return;
+          }
+
+          // Hardware Socket Backpressure
           if (dc.bufferedAmount > BUF_HI) {
-            await waitForDrain(dc);
+             // Hardware limit reached. `bufferedamountlow` hardware event listener will resume us seamlessly!
+             return; 
           }
-          if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
 
-          let end = Math.min(pos + currentChunkSize, bigView.length);
-          // subarray = zero-copy view (no allocation)
-          let chunk = bigView.subarray(pos, end);
+          if (!batchView) {
+             if (offset === 0) {
+               updateReceiver(receiverId, { currentFile: fi });
+               dcSendJSON(dc, { type: 'file-start', index: fi, name: file.name, size: file.size, fileType: file.type });
+             }
+             const batchBytes = currentChunkSize * READ_AHEAD;
+             const batchEnd = Math.min(offset + batchBytes, file.size);
+             if (batchEnd <= offset) {
+               dcSendJSON(dc, { type: 'file-end', index: fi });
+               fi++;
+               offset = 0;
+               continue;
+             }
+             const bigBuf = await file.slice(offset, batchEnd).arrayBuffer();
+             batchView = new Uint8Array(bigBuf);
+             batchPos = 0;
+          }
+
+          const chunkLen = Math.min(currentChunkSize, batchView.length - batchPos);
+          const chunk = batchView.subarray(batchPos, batchPos + chunkLen);
 
           try {
             dc.send(chunk);
           } catch (err) {
-            // Buffer overflow OR WebRTC Message Too Large Exception
             if (err.name === 'TypeError' || String(err).includes('too large')) {
-               // Browser rejected message size — step down chunk permanently
                currentChunkSize = Math.max(16 * 1024, Math.floor(currentChunkSize / 2));
                maxAllowedChunkSize = currentChunkSize;
                lastSentChunkSize = currentChunkSize;
                dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
-               end = Math.min(pos + currentChunkSize, bigView.length);
-               chunk = bigView.subarray(pos, end);
             }
-
-            await waitForDrain(dc);
-            if (!dc || dc.readyState !== 'open') break;
-            try {
-              dc.send(chunk);
-            } catch (err2) {
-              clearInterval(progressTimer);
-              transferDone = true;
-              updateReceiver(receiverId, { status: 'error', error: 'Send failed' });
-              if (dc) dc.onmessage = null;
-              return;
-            }
+            return; // Let the next cycle retry the slice with updated buffers
           }
 
-          pos += chunk.byteLength;
+          batchPos += chunk.byteLength;
+          offset += chunk.byteLength;
           globalBytesSent += chunk.byteLength;
           inFlightBytes = globalBytesSent - receiverBytes;
           chunksSent++;
+
+          if (batchPos >= batchView.length) {
+            batchView = null; // Clear view and load next buffer cycle
+          }
+
+          if (offset >= file.size) {
+            dcSendJSON(dc, { type: 'file-end', index: fi });
+            fi++;
+            offset = 0;
+            batchView = null;
+          }
         }
-
-        offset += bigView.length;
-
-        // Check pause between batches (not per-chunk)
-        if (pausedRef.current || conn._remotePaused) {
-          await waitIfPaused(pausedRef, destroyedRef, isRemotePaused);
+      } finally {
+        isPumping = false;
+        if (fi >= filesToSend.length && !transferDone) {
+           startFinishWait();
         }
       }
+    };
 
-      if (destroyedRef.current || conn._cancelled) break;
-      if (!dc || dc.readyState !== 'open') break;
+    // Attach native hardware listener and bootstrap
+    dc.bufferedAmountLowThreshold = BUF_LO;
+    dc.addEventListener('bufferedamountlow', pumpData);
+    pumpData();
 
-      dcSendJSON(dc, { type: 'file-end', index: fi });
-    }
-
-    // ===== CLEANUP PROGRESS TIMER =====
-    clearInterval(progressTimer);
-    transferDone = true;
-
-    // Check cancel BEFORE marking done
-    if (destroyedRef.current || conn._cancelled) {
-      if (dc) dc.onmessage = null;
-      setReceivers(prev => prev.map(r => {
-        if (r.id === receiverId && r.status !== 'cancelled') {
-          return { ...r, status: 'disconnected' };
-        }
-        return r;
-      }));
-      return;
-    }
-
-    // Wait for receiver confirmation
-    await new Promise((resolve) => {
-      if (receiverBytes >= grandTotal) return resolve();
-      
-      const finish = () => {
-        dc.removeEventListener('message', onMsg);
-        clearInterval(cancelCheck);
-        resolve();
-      };
-
-      const onMsg = (event) => {
-        if (typeof event.data === 'string') {
-          try {
-            const msg = JSON.parse(event.data);
-            if (msg.type === 'ack' && msg.received >= grandTotal) {
-              finish();
-            }
-            if (msg.type === 'cancel') {
-              conn._cancelled = true;
-              finish();
-            }
-          } catch (e) {}
-        }
-      };
-      
-      dc.addEventListener('message', onMsg);
-      
-      let lastRecv = receiverBytes;
-      let idleTime = 0;
-      
-      const cancelCheck = setInterval(() => {
-        if (conn._cancelled || destroyedRef.current || !dc || dc.readyState !== 'open') {
-          finish();
-          return;
-        }
-        
-        if (receiverBytes > lastRecv) {
-          lastRecv = receiverBytes;
-          idleTime = 0;
-        } else if (!pausedRef.current && !conn._remotePaused) {
-          idleTime += 500;
-        }
-        
-        if (idleTime > 60000) { // 60s idle timeout
-          finish();
-        }
-      }, 500);
-    });
-
-    // Clean up
-    if (dc) dc.onmessage = null;
-
-    if (destroyedRef.current || conn._cancelled) {
-      setReceivers(prev => prev.map(r => {
-        if (r.id === receiverId && r.status !== 'cancelled') {
-          return { ...r, status: 'disconnected' };
-        }
-        return r;
-      }));
-      return;
-    }
-
-    dcSendJSON(dc, { type: 'all-done' });
-
-    const totalTime = (Date.now() - startTime) / 1000;
-    const completionTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-    updateReceiver(receiverId, {
-      status: 'done', progress: 100,
-      avgSpeed: grandTotal / totalTime,
-      totalTime, totalBytes: grandTotal,
-      speedLabel: getSpeedLabel(grandTotal / totalTime),
-      completionTime,
-    });
-    playDone();
   }, [updateReceiver]);
 
   // ---- PEER SETUP ----
@@ -618,7 +619,29 @@ export function useFileSender() {
 
         const currentFiles = filesRef.current;
         if (currentFiles.length) {
-          transferToReceiver(receiverId, conn, currentFiles);
+          // DO NOT start transfer immediately. Wait for device-info from Receiver.
+          // This allows Auto-Resumption offsets to be configured before pumping data!
+          const onFirstMsg = (event) => {
+             if (typeof event.data === 'string') {
+               try {
+                 const msg = JSON.parse(event.data);
+                 if (msg.type === 'device-info') {
+                    updateReceiver(receiverId, { device: msg.device || '' });
+                    dc.removeEventListener('message', onFirstMsg);
+                    
+                    // If the device re-connected, scrub any matching old receiver to prevent ghost UI elements
+                    setReceivers(prev => {
+                       const exists = prev.some(r => r.id !== receiverId && r.status === 'disconnected' && r.device === msg.device);
+                       if (exists) return prev.filter(r => !(r.id !== receiverId && r.status === 'disconnected' && r.device === msg.device));
+                       return prev;
+                    });
+                    
+                    transferToReceiver(receiverId, conn, currentFiles, msg.resumeIndex || 0, msg.resumeOffset || 0);
+                 }
+               } catch (e) {}
+             }
+          };
+          dc.addEventListener('message', onFirstMsg);
         }
       });
 
@@ -1018,7 +1041,9 @@ export function useFileReceiver() {
   useEffect(() => { handleControlRef.current = handleControl; }, [handleControl]);
 
   // ---- CONNECT ----
+  const codeRef = useRef('');
   const connect = useCallback((code) => {
+    codeRef.current = code;
     if (peerRef.current) peerRef.current.destroy();
     destroyedRef.current = false;
     setStatus('connecting');
@@ -1048,7 +1073,12 @@ export function useFileReceiver() {
         dc.binaryType = 'arraybuffer';
         dcRef.current = dc;
 
-        dc.send(JSON.stringify({ type: 'device-info', device: getDeviceName() }));
+        dc.send(JSON.stringify({ 
+           type: 'device-info', 
+           device: getDeviceName(),
+           resumeIndex: currentFileIndex,
+           resumeOffset: grandReceivedRef.current
+        }));
 
         dc.onmessage = (event) => {
           if (destroyedRef.current) return;
@@ -1071,13 +1101,40 @@ export function useFileReceiver() {
         });
       });
 
+        if (peer.peerConnection) {
+          peer.peerConnection.addEventListener('iceconnectionstatechange', () => {
+             const state = peer.peerConnection.iceConnectionState;
+             if ((state === 'disconnected' || state === 'failed') && !destroyedRef.current && statusRef.current !== 'done') {
+                stopAckTimer();
+                setRemotePaused(false);
+                setPaused(false);
+                setStatus('reconnecting');
+             }
+          });
+        }
+
       conn.on('close', () => {
         if (!destroyedRef.current && statusRef.current !== 'done') {
           stopAckTimer();
-          freeBuffers();
           setRemotePaused(false);
           setPaused(false);
-          setError('Connection closed'); setStatus('error');
+          setStatus('reconnecting');
+          
+          // Reconnection attempt timer
+          setTimeout(() => {
+             if (!destroyedRef.current && statusRef.current === 'reconnecting') {
+                connect(codeRef.current);
+             }
+          }, 3000);
+          
+          // 5-minute memory purge timeout if we stay disconnected forever
+          setTimeout(() => {
+             if (statusRef.current === 'reconnecting') {
+                freeBuffers();
+                setError('Connection timed out permanently');
+                setStatus('error');
+             }
+          }, 5 * 60 * 1000);
         }
       });
       conn.on('error', (e) => {
