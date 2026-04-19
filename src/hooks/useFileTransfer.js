@@ -214,6 +214,7 @@ export function useFileSender() {
   const expiryRef = useRef(null);
   const pausedRef = useRef(false);
   const receiversRef = useRef([]);
+  const lastRestartRef = useRef(0);
 
   const isTransferring = receivers.some(r => r.status === 'transferring');
   useBeforeUnload(isTransferring || status === 'waiting');
@@ -262,6 +263,7 @@ export function useFileSender() {
     let currentSpeed = 0;
     let inFlightBytes = 0;
     let transferDone = false; // flag to stop the progress timer
+    let progressTimer = null;
     let lastAckTime = Date.now();
 
     // Remote pause flag
@@ -317,6 +319,8 @@ export function useFileSender() {
          return;
       }
       if (Date.now() - lastAckTime > 5000 && dc.bufferedAmount > 0 && !pausedRef.current && !conn._remotePaused) {
+        if (Date.now() - lastRestartRef.current < 5000) return;
+        lastRestartRef.current = Date.now();
         console.log("[DropBeam] Stuck detected → reconnecting sender full stack");
         
         // SENDER CLEANUP AND STATE TEARDOWN
@@ -324,26 +328,29 @@ export function useFileSender() {
         isPumping = false;
         if (dc) {
            dc.onmessage = null;
-           dc.onbufferedamountlow = null;
+           if (dc._pumpHandler) {
+               dc.removeEventListener('bufferedamountlow', dc._pumpHandler);
+               dc._pumpHandler = null;
+           }
         }
-        clearInterval(progressTimer);
+        if (progressTimer) clearInterval(progressTimer);
         clearInterval(watchdog);
         
         conn.close();
         
-        // Force bidirectional recovery
+        // Force bidirectional recovery with extended padding
         setTimeout(() => {
           if (!destroyedRef.current && peerRef.current) {
             initPeer(peerRef.current.id);
           }
-        }, 1000);
+        }, 1500);
       }
     }, 3000);
 
     // ===== PROGRESS TIMER — runs every 200ms =====
     // We strictly use receiver ACKs for speed, avoiding local dc.bufferedAmount glitches 
     // that falsely reported 0 B/s on fast connections.
-    const progressTimer = setInterval(() => {
+    progressTimer = setInterval(() => {
       if (transferDone) return;
       
       // Use receiverBytes for display to ensure perfect sync between Sender and Receiver pages
@@ -571,7 +578,8 @@ export function useFileSender() {
 
     // Attach native hardware listener and bootstrap
     dc.bufferedAmountLowThreshold = BUF_LO;
-    dc.addEventListener('bufferedamountlow', pumpData);
+    dc._pumpHandler = pumpData;
+    dc.addEventListener('bufferedamountlow', dc._pumpHandler);
     pumpData();
 
   }, [updateReceiver]);
