@@ -392,11 +392,16 @@ export function useFileSender() {
           if (!dc || dc.readyState !== 'open') break;
 
           // CRITICAL APPLICATION-LEVEL BACKPRESSURE 
-          // Do not send if WebRTC buffer is full OR if receiver is lagging more than 4MB behind!
-          while (globalBytesSent - receiverBytes > 4 * 1024 * 1024 || dc.bufferedAmount > BUF_HI) {
+          // Do not send if WebRTC buffer is full, if receiver is lagging more than 1MB behind, or if paused!
+          while (
+            globalBytesSent - receiverBytes > 1 * 1024 * 1024 || 
+            dc.bufferedAmount > BUF_HI ||
+            conn._remotePaused ||
+            pausedRef.current
+          ) {
             if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
             // Short yield to event loop while waiting for ACKs to reduce globalBytesSent - receiverBytes
-            await new Promise(r => setTimeout(r, 20)); 
+            await new Promise(r => setTimeout(r, 50)); 
           }
           if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
 
@@ -554,7 +559,7 @@ export function useFileSender() {
 
     const myCode = generateCode();
     const peer = new Peer(myCode, {
-      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
+      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10, bundlePolicy: 'max-bundle' },
       debug: 0
     });
 
@@ -1002,7 +1007,7 @@ export function useFileReceiver() {
     setPaused(false);
 
     const peer = new Peer({
-      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
+      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10, bundlePolicy: 'max-bundle' },
       debug: 0
     });
 
