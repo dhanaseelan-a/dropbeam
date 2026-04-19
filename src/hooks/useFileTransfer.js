@@ -391,17 +391,22 @@ export function useFileSender() {
           if (destroyedRef.current || conn._cancelled) break;
           if (!dc || dc.readyState !== 'open') break;
 
-          // CRITICAL APPLICATION-LEVEL BACKPRESSURE 
-          // Do not send if WebRTC buffer is full, if receiver is lagging more than 1MB behind, or if paused!
+          // 1. Application-Level Backpressure & Pause
+          // Hides network jitter up to 4MB in-flight. Blocks instantly on pause.
           while (
-            globalBytesSent - receiverBytes > 1 * 1024 * 1024 || 
-            dc.bufferedAmount > BUF_HI ||
+            globalBytesSent - receiverBytes > 4 * 1024 * 1024 || 
             conn._remotePaused ||
             pausedRef.current
           ) {
             if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
-            // Immediate yield to event loop while waiting for ACKs 
-            await new Promise(r => setTimeout(r, 5)); 
+            await new Promise(r => setTimeout(r, 50)); 
+          }
+          if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
+
+          // 2. WebRTC Socket Hardware Backpressure 
+          // Uses instantaneous event-driven wakeups (bufferedamountlow) for max throughput.
+          if (dc.bufferedAmount > BUF_HI) {
+            await waitForDrain(dc);
           }
           if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') break;
 
