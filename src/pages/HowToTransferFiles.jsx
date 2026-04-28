@@ -1,7 +1,16 @@
 import { useNavigate } from 'react-router-dom';
+import useSEO from '../hooks/useSEO';
+
 
 export default function HowToTransferFiles() {
   const navigate = useNavigate();
+
+  useSEO({
+    title: 'How to Transfer Files Between Devices (Phone, PC, Mac) — DropBeam',
+    description: 'Sending files between your phone, tablet, and computer should not be complicated. Learn how to transfer files in 3 simple steps with DropBeam.',
+    url: 'https://dropbeam.tech/how-to-transfer-files',
+  });
+
 
   return (
     <div className="app-container seo-page">

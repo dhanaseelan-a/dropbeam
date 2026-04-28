@@ -1,7 +1,16 @@
 import { useNavigate } from 'react-router-dom';
+import useSEO from '../hooks/useSEO';
+
 
 export default function WebRTCFileTransfer() {
   const navigate = useNavigate();
+
+  useSEO({
+    title: 'WebRTC File Transfer | Fast, Private & Serverless — DropBeam',
+    description: 'Learn how DropBeam uses WebRTC to transfer files directly between devices without cloud servers. Secure, private, and unlimited file sharing.',
+    url: 'https://dropbeam.tech/webrtc-file-transfer',
+  });
+
 
   return (
     <div className="app-container seo-page">

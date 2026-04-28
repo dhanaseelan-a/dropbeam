@@ -1,7 +1,16 @@
 import { useNavigate } from 'react-router-dom';
+import useSEO from '../hooks/useSEO';
+
 
 export default function SendLargeFiles() {
   const navigate = useNavigate();
+
+  useSEO({
+    title: 'Send Large Files Online Free | No Size Limits — DropBeam',
+    description: 'Send files of any size directly to another device. No upload wait, no cloud storage, no compression. Perfect for 4K videos, raw footage, and big archives.',
+    url: 'https://dropbeam.tech/send-large-files-online',
+  });
+
 
   return (
     <div className="app-container seo-page">

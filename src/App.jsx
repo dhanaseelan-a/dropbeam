@@ -1,11 +1,18 @@
 import { useState, useCallback, useEffect } from 'react';
 import SendPage from './pages/SendPage';
 import ReceivePage from './pages/ReceivePage';
+import useSEO from './hooks/useSEO';
 import './App.css';
 
 function App() {
   const [mode, setMode] = useState('send');
   const [isTransferring, setIsTransferring] = useState(false);
+
+  useSEO({
+    title: 'DropBeam — Free P2P File Transfer | Send Files Between Devices Instantly',
+    description: 'DropBeam lets you beam files directly between devices using secure peer-to-peer WebRTC. No sign up, no file size limits, no files stored on servers. Free and instant.',
+    url: 'https://dropbeam.tech/',
+  });
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);

@@ -1,7 +1,16 @@
 import { useNavigate } from 'react-router-dom';
+import useSEO from '../hooks/useSEO';
+
 
 export default function AirdropAlternative() {
   const navigate = useNavigate();
+
+  useSEO({
+    title: 'Cross-Platform AirDrop Alternative | iPhone to Windows & Android to Mac — DropBeam',
+    description: 'Love AirDrop but need it to work between iPhone and Windows? Or Android and Mac? DropBeam is the cross-platform AirDrop alternative that works everywhere.',
+    url: 'https://dropbeam.tech/airdrop-alternative',
+  });
+
 
   return (
     <div className="app-container seo-page">
