@@ -9,10 +9,11 @@ import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { createServer } from "vite";
 import JSZip from "jszip";
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const testRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const root = process.env.DROPBEAM_SOURCE_ROOT || testRoot;
 const vite = await createServer({
   root,
-  resolve: { alias: { peerjs: join(root, "tests/browser/peerStub.js") } },
+  resolve: { alias: { peerjs: join(testRoot, "tests/browser/peerStub.js") } },
   server: { host: "127.0.0.1", port: 0, hmr: false },
 });
 await vite.listen();
@@ -122,10 +123,18 @@ try {
   const a = await receiver(pair.code);
   const b = await receiver(pair.code);
   await a.r.waitForFunction(() => window.__rxBytes > 800000);
+  await a.r.evaluate(() => { window.__failControls = ['pause', 'resume']; });
   await a.r.getByRole("button", { name: "⏸ Pause", exact: true }).click();
   await a.r.locator(".pause-banner").waitFor();
-  await pair.s.locator(".remote-pause-banner").waitFor();
+  await pair.s.locator(".remote-pause-banner").waitFor({ timeout: 3000 });
+  await a.r.waitForTimeout(200);
+  const pausedBytes = await a.r.evaluate(() => window.__rxBytes);
+  const otherBytes = await b.r.evaluate(() => window.__rxBytes);
+  await a.r.waitForTimeout(400);
+  assert.equal(await a.r.evaluate(() => window.__rxBytes), pausedBytes, 'paused receiver must stop receiving bytes');
+  assert.ok(await b.r.evaluate(() => window.__rxBytes) > otherBytes, 'other receiver must keep transferring');
   await a.r.getByRole("button", { name: "▶ Resume", exact: true }).click();
+  await a.r.waitForFunction(previous => window.__rxBytes > previous + 65536, pausedBytes, { timeout: 3000 });
   await a.r.evaluate(() => window.__pcs.at(-1).close());
   await a.r
     .getByText("Connection interrupted — reconnecting...")
@@ -191,13 +200,26 @@ try {
   });
   const cancelReceiver = await receiver(cancelPair.code);
   await cancelReceiver.r.waitForFunction(() => window.__rxBytes > 200000);
+  await cancelPair.s.evaluate(() => { window.__failControls = ['pause', 'resume']; });
   await cancelPair.s
     .getByRole("button", { name: "⏸ Pause", exact: true })
     .click();
-  await cancelReceiver.r.locator(".remote-pause-banner").waitFor();
+  await cancelReceiver.r.locator(".remote-pause-banner").waitFor({ timeout: 3000 });
+  await cancelReceiver.r.waitForTimeout(200);
+  const senderPausedBytes = await cancelReceiver.r.evaluate(() => window.__rxBytes);
+  await cancelReceiver.r.waitForTimeout(400);
+  assert.equal(await cancelReceiver.r.evaluate(() => window.__rxBytes), senderPausedBytes);
+  await cancelReceiver.r.evaluate(() => { window.__failControls = ['pause', 'resume']; });
+  await cancelReceiver.r.getByRole('button', { name: '⏸ Pause', exact: true }).click();
+  await cancelPair.s.locator('.remote-pause-banner').waitFor({ timeout: 3000 });
   await cancelPair.s
     .getByRole("button", { name: "▶ Resume", exact: true })
     .click();
+  await cancelReceiver.r.locator(".remote-pause-banner").waitFor({ state: 'hidden', timeout: 3000 });
+  await cancelReceiver.r.waitForTimeout(300);
+  assert.equal(await cancelReceiver.r.evaluate(() => window.__rxBytes), senderPausedBytes, 'receiver pause must survive a sender resume');
+  await cancelReceiver.r.getByRole('button', { name: '▶ Resume', exact: true }).click();
+  await cancelReceiver.r.waitForFunction(previous => window.__rxBytes > previous + 65536, senderPausedBytes, { timeout: 3000 });
   cancelReceiver.r.once("dialog", (dialog) => dialog.accept());
   await cancelReceiver.r
     .getByRole("button", { name: "✕ Cancel", exact: true })

@@ -20,6 +20,14 @@ class DataChannel extends EventTarget {
   send(data) {
     if (this.readyState !== "open")
       throw new DOMException("Closed", "InvalidStateError");
+    if (typeof data === "string") {
+      const type = JSON.parse(data).type;
+      const index = (window.__failControls || []).indexOf(type);
+      if (index >= 0) {
+        window.__failControls.splice(index, 1);
+        throw new DOMException("Injected full control buffer", "OperationError");
+      }
+    }
     if (typeof data !== "string") {
       if (window.__chunkLimit && data.byteLength > window.__chunkLimit)
         throw new TypeError("Limited message");

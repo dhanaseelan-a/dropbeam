@@ -4,7 +4,7 @@ import { getFileIcon } from '../components/FilePreview';
 
 function ReceivePage({ onTransferStateChange }) {
   const {
-    status, progress, speed, speedRaw, eta, etc, error,
+    status, progress, speed, speedRaw, eta, etc, error, networkWarning,
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, activeChunkSize,
     networkMode, speedLabel, remotePaused, paused, togglePause,
@@ -46,6 +46,8 @@ function ReceivePage({ onTransferStateChange }) {
 
   return (
     <div className="fade-in">
+      {networkWarning && ['connecting', 'reconnecting', 'error'].includes(status) &&
+        <p className="network-warning code-hint" role="status">{networkWarning}</p>}
       {(status === 'idle' || status === 'connecting') && (
         <div className="glass-card">
           <div className="code-input-container">

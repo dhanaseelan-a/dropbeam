@@ -7,7 +7,7 @@ import { FilePreview, FileThumbnail, getFileIcon } from '../components/FilePrevi
 
 function SendPage({ onTransferStateChange }) {
   const {
-    status, code, files, setFiles, error, codeExpiry,
+    status, code, files, setFiles, error, networkWarning, codeExpiry,
     paused, togglePause,
     receivers, initPeer, cleanup
   } = useFileSender();
@@ -183,6 +183,7 @@ function SendPage({ onTransferStateChange }) {
 
       {files.length > 0 && status !== 'idle' && (
         <div className="glass-card slide-up">
+          {networkWarning && status === 'waiting' && <p className="network-warning code-hint" role="status">{networkWarning}</p>}
           {/* File list */}
           <div className="file-list">
             {files.map((f, i) => (

@@ -1,9 +1,14 @@
 // Transport code is independent of React so byte ordering, retries and resume
 // can be tested without a signalling service or a particular mobile carrier.
-export const CHUNK_SIZE = 64 * 1024;
-export const MAX_CHUNK = 256 * 1024;
-const BUFFER_HIGH = 4 * 1024 * 1024;
-const BUFFER_LOW = 1024 * 1024;
+import { flushControlMessages } from './controlMessages.js';
+
+// Start with small SCTP messages to avoid monopolising slower associations
+// (RFC 8831, section 6.6); retain bounded adaptation for fast, low-latency paths.
+export const CHUNK_SIZE = 16 * 1024;
+export const MAX_CHUNK = 64 * 1024;
+const MIN_BUFFER = 64 * 1024;
+const MAX_BUFFER = 2 * 1024 * 1024;
+const MIN_IN_FLIGHT = 128 * 1024;
 const READ_SIZE = 4 * 1024 * 1024;
 const MAX_IN_FLIGHT = 16 * 1024 * 1024;
 
@@ -121,8 +126,10 @@ export function createFilePump({
   let batch = null, batchPosition = 0, fileStarted = false, manifestSent = false;
   let pumping = false, stopped = false, finishing = false, queued = false;
   let retryTimer = null, lastProgress = Date.now(), lastUI = 0;
+  let bufferHigh = MIN_BUFFER, flightLimit = MIN_IN_FLIGHT, roundTrip = 100;
+  const flights = [];
   const startedAt = Date.now();
-  channel.bufferedAmountLowThreshold = BUFFER_LOW;
+  channel.bufferedAmountLowThreshold = bufferHigh / 2;
 
   function dispose() {
     stopped = true;
@@ -179,14 +186,29 @@ export function createFilePump({
     try { message = JSON.parse(event.data); } catch { return; }
     if (message.type === 'ack') {
       if (Number.isFinite(message.received) && message.received >= received && message.received <= sent) {
-        if (message.received > received) lastProgress = Date.now();
+        if (message.received > received) {
+          lastProgress = Date.now();
+          let latest;
+          while (flights.length && flights[0].end <= message.received) latest = flights.shift();
+          if (latest) roundTrip = roundTrip * 0.75 + (Date.now() - latest.time) * 0.25;
+        }
         received = message.received;
       }
       speed = Number.isFinite(message.speed) ? Math.max(0, message.speed) : speed;
       eta = message.eta || '';
       etc = message.etc || '';
-      const desired = speed > 10 * 1024 * 1024 ? MAX_CHUNK : CHUNK_SIZE;
-      chunkSize = Math.min(desired, chunkLimit);
+      // Grow with measured delivery rate and latency, rather than immediately
+      // queuing 4 MB on a slow phone. Fast paths keep enough bytes in flight;
+      // slow paths drain promptly when either user presses Pause.
+      if (speed > 0) {
+        bufferHigh = Math.max(MIN_BUFFER, Math.min(MAX_BUFFER, speed * 0.075));
+        flightLimit = Math.max(MIN_IN_FLIGHT, Math.min(MAX_IN_FLIGHT, speed * (roundTrip / 1000 * 1.5 + 0.15)));
+        channel.bufferedAmountLowThreshold = Math.floor(bufferHigh / 2);
+      }
+      chunkSize = Math.min(chunkLimit, speed > 10 * 1024 * 1024 && roundTrip < 50 ? MAX_CHUNK : CHUNK_SIZE);
+      if (typeof message.paused === 'boolean') {
+        remotePaused = message.paused;
+      }
       report();
       // Resume immediately on acknowledgements, including in background tabs.
       wake();
@@ -212,7 +234,8 @@ export function createFilePump({
     pumping = true;
     try {
       while (!stopped && channel.readyState === 'open') {
-        if (channel.bufferedAmount > BUFFER_HIGH || sent - received >= MAX_IN_FLIGHT) return;
+        if (!flushControlMessages(channel)) { retry(); return; }
+        if (channel.bufferedAmount >= bufferHigh || sent - received >= flightLimit) return;
         if (!manifestSent) {
           if (!send(JSON.stringify({ type: 'file-list', protocol: 2, transferId,
             files: files.map(f => ({ name: f.name, size: f.size, fileType: f.type })),
@@ -264,6 +287,8 @@ export function createFilePump({
         batchPosition += length;
         offset += length;
         sent += length;
+        // At most one RTT sample per 64 KB keeps bookkeeping bounded.
+        if (!flights.length || sent - flights.at(-1).end >= MIN_BUFFER) flights.push({ end: sent, time: Date.now() });
         chunksSent++;
         if (batchPosition === batch.byteLength) batch = null;
       }

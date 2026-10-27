@@ -1,5 +1,7 @@
 // Optional Vercel function. These are server environment variables, never VITE_*.
 // Without them, the client continues to use its public STUN/TURN fallback.
+import { validIceServers } from '../src/lib/rtcConfig.js';
+
 export default async function handler(request, response) {
   response.setHeader('Cache-Control', 'no-store');
   if (request.method !== 'GET') {
@@ -17,7 +19,9 @@ export default async function handler(request, response) {
     const upstream = await fetch(url, { signal: AbortSignal.timeout(3500) });
     if (!upstream.ok) throw new Error('TURN provider unavailable');
     const iceServers = await upstream.json();
-    if (!Array.isArray(iceServers) || !iceServers.length) throw new Error('Empty ICE configuration');
+    if (!validIceServers(iceServers) || !iceServers.some(server => [server.urls].flat().some(url => /^turns?:/.test(url)))) {
+      throw new Error('Invalid relay configuration');
+    }
     return response.status(200).json({ iceServers });
   } catch {
     // Do not include the credential URL or API key in errors/logs.

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createFilePump, ReceiveSession, resumePosition, negotiatedChunkSize } from '../src/lib/transferProtocol.js';
 import { getRTCConfig, detectNetwork } from '../src/lib/rtcConfig.js';
+import { sendControlMessage } from '../src/lib/controlMessages.js';
 
 class Channel extends EventTarget {
   readyState = 'open';
@@ -189,9 +190,49 @@ test('ACK of all bytes alone does not bypass receiver completion', async () => {
 });
 
 test('negotiated limits include absent and unlimited SCTP sizes', () => {
-  assert.equal(negotiatedChunkSize(undefined), 65536);
-  assert.equal(negotiatedChunkSize(0), 262144);
+  assert.equal(negotiatedChunkSize(undefined), 16384);
+  assert.equal(negotiatedChunkSize(0), 65536);
   assert.equal(negotiatedChunkSize(16384), 16384);
+  assert.equal(negotiatedChunkSize(4096), 4096);
+});
+
+test('pause and resume survive full native control queues', async () => {
+  const channel = new Channel();
+  const received = [];
+  channel.onSend = data => received.push(JSON.parse(data).type);
+  for (const type of ['pause', 'resume', 'device-info', 'complete']) {
+    channel.failures = 2;
+    sendControlMessage(channel, { type });
+    await delay(60);
+    assert.equal(received.at(-1), type);
+  }
+  channel.close();
+});
+
+test('only the latest pause state and ACK wait in a full buffer', async () => {
+  const channel = new Channel();
+  channel.failures = 100;
+  sendControlMessage(channel, { type: 'pause' });
+  sendControlMessage(channel, { type: 'resume' });
+  for (let i = 0; i < 20; i++) sendControlMessage(channel, { type: 'ack', received: i });
+  channel.failures = 0;
+  await delay(40);
+  assert.deepEqual(channel.messages.map(JSON.parse), [{ type: 'resume' }, { type: 'ack', received: 19 }]);
+  channel.close();
+});
+
+test('slow paths do not queue megabytes before the first delivery feedback', async () => {
+  const channel = new Channel();
+  let paused = false;
+  const pump = createFilePump({ channel, files: [makeFile('slow', 5 * 1024 * 1024)], transferId: 'x',
+    isPaused: () => paused });
+  await delay(60);
+  const bytes = channel.messages.filter(m => typeof m !== 'string').reduce((n, m) => n + m.byteLength, 0);
+  assert.ok(bytes > 0 && bytes <= 128 * 1024, `unexpected initial queue: ${bytes}`);
+  paused = true;
+  await delay(30);
+  assert.equal(channel.messages.filter(m => typeof m !== 'string').reduce((n, m) => n + m.byteLength, 0), bytes);
+  pump.cancel(); channel.close();
 });
 
 test('static deployment retains UDP, TCP and TLS relay candidates', async () => {
@@ -207,6 +248,30 @@ test('both peers can use configured credentials and relay-only recovery', async 
   const iceServers = [{ urls: 'turns:example.org:443?transport=tcp', username: 'u', credential: 'p' }];
   const config = await getRTCConfig({ relayOnly: true, fetcher: async () => ({ ok: true, json: async () => ({ iceServers }) }) });
   assert.deepEqual(config.iceServers, iceServers); assert.equal(config.iceTransportPolicy, 'relay');
+});
+
+test('missing relay configuration is visible while direct transfers remain available', async () => {
+  let warning;
+  const config = await getRTCConfig({ fetcher: async () => ({ ok: false, status: 503 }), onWarning: message => { warning = message; } });
+  assert.match(warning, /relay service needs setup/);
+  assert.equal(config.iceTransportPolicy, 'all');
+  assert.ok(config.iceServers.length > 0);
+});
+
+test('valid TURN credentials clear the relay warning', async () => {
+  let warning = 'old';
+  const iceServers = [{ urls: 'turns:example.org:443', username: 'u', credential: 'p' }];
+  await getRTCConfig({ fetcher: async () => ({ ok: true, json: async () => ({ iceServers }) }), onWarning: message => { warning = message; } });
+  assert.equal(warning, '');
+});
+
+test('one host candidate does not mislabel an Internet transfer as same Wi-Fi', async () => {
+  const stats = new Map([
+    ['transport', { type: 'transport', selectedCandidatePairId: 'pair' }],
+    ['pair', { localCandidateId: 'local', remoteCandidateId: 'remote' }],
+    ['local', { candidateType: 'host' }], ['remote', { candidateType: 'srflx' }],
+  ]);
+  assert.deepEqual(await detectNetwork({ peerConnection: { getStats: async () => stats } }), { mode: 'internet' });
 });
 
 test('network label uses the selected pair, not an unused successful candidate', async () => {

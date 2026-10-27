@@ -11,6 +11,11 @@ The public OpenRelay credentials are retained as a best-effort fallback. They
 are shared infrastructure: their availability, capacity and performance are
 outside this repository's control. Adding TCP/TLS URLs alone does not prove
 that a particular Jio, Airtel or Vi connection will work.
+The provider's current instructions require account-issued credentials; do not
+treat the legacy public username/password as a configured or verified relay.
+An HTTP 503 from this site's credential endpoint is a deployment configuration
+error on every carrier, not an error returned by Jio. The app now explains this
+when connecting and continues to allow direct connections.
 
 For dependable operation on networks that need a relay:
 
@@ -39,6 +44,16 @@ deadline so an unavailable endpoint cannot leave connection setup hanging.
 - Retry full-buffer errors for both file bytes and control messages. Resume
   immediately on acknowledgements and low-buffer events; polling is only a
   safety net.
+- Queue and retry Pause, Resume, handshake and completion messages instead of
+  silently dropping them when a browser reports a full buffer. Repeat receiver
+  pause state in acknowledgements and keep each side's pause independent.
+- Start with a 128 KB delivery window, adapt buffering to delivered speed and
+  acknowledgement latency, and start with 16 KB SCTP messages (up to 64 KB on
+  fast, low-latency paths within the browser's negotiated limit). This limits queued data
+  after Pause without imposing a fixed low-bandwidth cap on fast connections.
+  Bytes already accepted by the network still need to drain before stopping.
+- Schedule pending acknowledgements within 20 ms instead of waiting for a
+  200 ms heartbeat when a partial batch is below the old byte threshold.
 - Use bounded read batches and Blob parts instead of allocating a contiguous
   buffer as large as 512 MB on the receiving phone.
 - Resume with a transfer ID, completed file index and **per-file** byte offset.
@@ -61,6 +76,9 @@ two identical-device receivers, pauses, cancellation, folder ZIP contents and
 reconnecting during a later file without duplicate downloads. It does not test
 native ICE or TURN. An existing Chromium executable can be selected with
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`.
+The pause tests inject buffer errors into Pause and Resume, check that byte
+counters stop and restart (not just that a banner appears), and check that one
+receiver's pause does not stop another receiver or override the sender's pause.
 
 The carrier check requires physical devices and a functioning TURN service;
 local tests do not reproduce a carrier's routing, CGNAT, IPv6 or firewall.
