@@ -49,3 +49,13 @@ test('relay provider failure does not leak its request URL or API key', async t 
   const res = response(); await handler({ method: 'GET' }, res);
   assert.equal(res.statusCode, 502); assert.ok(!JSON.stringify(res).includes('secret'));
 });
+
+test('invalid or STUN-only provider responses cannot masquerade as a working relay', async t => {
+  env(t, 'METERED_DOMAIN', 'dropbeam.metered.ca'); env(t, 'METERED_API_KEY', 'secret');
+  for (const servers of [[null], [{ urls: 'turns:relay.example:443' }], [{ urls: 'stun:example.org:3478' }]]) {
+    const fetch = t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => servers }));
+    const res = response(); await handler({ method: 'GET' }, res);
+    assert.equal(res.statusCode, 502);
+    fetch.mock.restore();
+  }
+});

@@ -3,6 +3,7 @@ import Peer from 'peerjs';
 
 import { CHUNK_SIZE, createFilePump, ReceiveSession, resumePosition } from '../lib/transferProtocol';
 import { getRTCConfig, detectNetwork } from '../lib/rtcConfig';
+import { sendControlMessage as dcSendJSON } from '../lib/controlMessages';
 
 const NETWORK_MODES = {
   lan:      { label: 'LAN / Hotspot', icon: '🔌', color: '#22c55e', detail: 'Same network' },
@@ -93,18 +94,13 @@ function playDone() {
 
 function getDC(conn) { return conn?.dataChannel || conn?._dc; }
 
-function dcSendJSON(dc, message) {
-  if (dc?.readyState !== 'open') return;
-  try { dc.send(JSON.stringify(message)); }
-  catch { /* ACKs repeat; closed channels are handled by connection recovery. */ }
-}
-
 // ====== SENDER ======
 export function useFileSender() {
   const [status, setStatusState] = useState('idle');
   const [code, setCode] = useState('');
   const [files, setFilesState] = useState([]);
   const [error, setError] = useState('');
+  const [networkWarning, setNetworkWarning] = useState('');
   const [codeExpiry, setCodeExpiry] = useState(null);
   const [paused, setPaused] = useState(false);
   const [receivers, setReceivers] = useState([]);
@@ -150,7 +146,7 @@ export function useFileSender() {
     stopConnections();
     pausedRef.current = false;
     setStatus('idle'); setCode(''); setFiles([]); setError('');
-    setReceivers([]); setPaused(false); setCodeExpiry(null);
+    setReceivers([]); setPaused(false); setCodeExpiry(null); setNetworkWarning('');
   }, [stopConnections, setStatus, setFiles]);
   useEffect(() => cleanup, [cleanup]);
 
@@ -191,7 +187,7 @@ export function useFileSender() {
     setReceivers([]); setCodeExpiry(null); setPaused(false); setError('');
     setStatus('waiting');
     setCode('');
-    const config = await getRTCConfig();
+    const config = await getRTCConfig({ onWarning: message => { if (active()) setNetworkWarning(message); } });
     if (!active()) return;
     const peer = new Peer(existingCode || generateCode(), { config, debug: 0 });
     peerRef.current = peer;
@@ -285,10 +281,13 @@ export function useFileSender() {
             },
             onControl: msg => {
               if (!active()) return;
-              if (msg.type === 'pause' || msg.type === 'resume') {
-                receiver.remotePaused = msg.type === 'pause';
-                updateReceiver(receiverId, { remotePaused: receiver.remotePaused });
-                if (!receiver.remotePaused) pump?.wake();
+              if (msg.type === 'pause' || msg.type === 'resume' || (msg.type === 'ack' && typeof msg.paused === 'boolean')) {
+                const nextPaused = msg.type === 'ack' ? msg.paused : msg.type === 'pause';
+                if (receiver.remotePaused !== nextPaused) {
+                  receiver.remotePaused = nextPaused;
+                  updateReceiver(receiverId, { remotePaused: nextPaused });
+                  if (!nextPaused) pump?.wake();
+                }
               }
               if (msg.type === 'cancel') {
                 updateReceiver(receiverId, { status: 'cancelled' });
@@ -361,7 +360,7 @@ export function useFileSender() {
     });
   }, [stopConnections, setStatus, updateReceiver]);
 
-  return { status, code, files, setFiles, error, codeExpiry, paused, togglePause,
+  return { status, code, files, setFiles, error, networkWarning, codeExpiry, paused, togglePause,
     receivers, initPeer, cleanup, formatBytes };
 }
 
@@ -373,6 +372,7 @@ export function useFileReceiver() {
   const [status, setStatusState] = useState('idle');
   const [metrics, setMetrics] = useState(emptyMetrics);
   const [error, setError] = useState('');
+  const [networkWarning, setNetworkWarning] = useState('');
   const [fileList, setFileList] = useState([]);
   const [currentFileIndex, setCurrentFileIndex] = useState(0);
   const [currentFileName, setCurrentFileName] = useState('');
@@ -411,7 +411,7 @@ export function useFileReceiver() {
     setStatus('idle'); setError(''); setMetrics(emptyMetrics());
     setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
     setTransferStats(null); setPeerDevice(''); setNetworkMode(null); setActiveChunkSize(0);
-    setRemotePaused(false); setPaused(false);
+    setRemotePaused(false); setPaused(false); setNetworkWarning('');
   }, [stopConnection, setStatus]);
   useEffect(() => cleanup, [cleanup]);
 
@@ -432,9 +432,9 @@ export function useFileReceiver() {
     setStatus('connecting'); setError(''); setNetworkMode(null);
     setPaused(false); setRemotePaused(false); setMetrics(emptyMetrics());
     setTransferStats(null); setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
-    let retryTimer, connectionTimer, disconnectTimer, ackTimer;
+    let retryTimer, connectionTimer, disconnectTimer, ackTimer, ackDelayTimer;
     let attempts = 0, reconnectSince = 0, startedAt = 0, chunks = 0, observedChunkSize = 0;
-    let samples = [], lastAck = 0, lastUI = 0, lastAckBytes = 0;
+    let samples = [], lastAck = 0, lastUI = 0;
     let lastSpeed = 0, lastEta = '', lastEtc = '';
     let removeMessage = () => {};
     let relayOnly = false;
@@ -443,6 +443,7 @@ export function useFileReceiver() {
     const disposeAttempt = () => {
       attemptGeneration++;
       clearTimeout(connectionTimer); clearTimeout(disconnectTimer); clearInterval(ackTimer);
+      clearTimeout(ackDelayTimer); ackDelayTimer = null;
       removeMessage(); removeMessage = () => {};
       const peer = peerRef.current;
       peerRef.current = null; connRef.current = null; dcRef.current = null;
@@ -459,23 +460,35 @@ export function useFileReceiver() {
       setError(message); setStatus('error');
     };
 
-    const sendAck = (force = false) => {
+    const sendAck = (force = false, refreshUI = force) => {
       const dc = dcRef.current;
       if (!dc || dc.readyState !== 'open') return;
       const now = Date.now();
-      if (!force && now - lastAck < 50) return;
+      if (!force && now - lastAck < 20) {
+        // A byte threshold alone can leave the final partial window waiting
+        // for the 200 ms heartbeat. Schedule its ACK instead of dropping it.
+        if (!ackDelayTimer) ackDelayTimer = setTimeout(() => {
+          ackDelayTimer = null;
+          sendAck(true, false);
+        }, 20 - (now - lastAck));
+        return;
+      }
+      clearTimeout(ackDelayTimer); ackDelayTimer = null;
       lastAck = now;
-      lastAckBytes = session.received;
       samples.push({ time: now, bytes: session.received });
       while (samples.length > 2 && now - samples[0].time > 3000) samples.shift();
       const first = samples[0];
       lastSpeed = now > first.time ? Math.max(0, (session.received - first.bytes) * 1000 / (now - first.time)) : 0;
       const remaining = lastSpeed > 0 ? (session.total - session.received) / lastSpeed : 0;
-      lastEta = lastSpeed > 0 ? formatTime(remaining) : '--:--';
-      lastEtc = lastSpeed > 0 ? new Date(now + remaining * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '';
+      const updateUI = refreshUI || now - lastUI >= 200;
+      if (updateUI) {
+        lastEta = lastSpeed > 0 ? formatTime(remaining) : '--:--';
+        lastEtc = lastSpeed > 0 ? new Date(now + remaining * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '';
+      }
       const progress = session.complete ? 100 : session.total ? Math.min(99, Math.round(session.received / session.total * 100)) : 0;
-      dcSendJSON(dc, { type: 'ack', received: session.received, progress, speed: lastSpeed, eta: lastEta, etc: lastEtc });
-      if (force || now - lastUI >= 200) {
+      dcSendJSON(dc, { type: 'ack', received: session.received, progress, speed: lastSpeed, eta: lastEta, etc: lastEtc,
+        paused: pausedRef.current });
+      if (updateUI) {
         lastUI = now;
         setMetrics({ progress, speed: lastSpeed, eta: lastEta, etc: lastEtc,
           bytesReceived: session.received, bytesTotal: session.total, chunksReceived: chunks,
@@ -506,7 +519,6 @@ export function useFileReceiver() {
           const continuing = session.begin(message);
           if (!continuing) { startedAt = Date.now(); chunks = 0; }
           samples = [{ time: Date.now(), bytes: session.received }];
-          lastAckBytes = session.received;
           setFileList(session.files); setPeerDevice(message.device || '');
           setActiveChunkSize(message.chunkSize || CHUNK_SIZE);
           setStatus('receiving');
@@ -536,6 +548,7 @@ export function useFileReceiver() {
           // verified, not just that the sender's native buffer became empty.
           dcSendJSON(dcRef.current, { type: 'complete', received: session.received });
           clearInterval(ackTimer); clearTimeout(connectionTimer); clearTimeout(disconnectTimer);
+          clearTimeout(ackDelayTimer); ackDelayTimer = null;
           const totalTime = Math.max(0.001, (Date.now() - startedAt) / 1000);
           const avgSpeed = session.received / totalTime;
           setTransferStats({ totalBytes: session.received, totalTime, avgSpeed,
@@ -561,7 +574,7 @@ export function useFileReceiver() {
       attempts++;
       const attemptId = ++attemptGeneration;
       const isCurrent = () => active() && attemptId === attemptGeneration;
-      const config = await getRTCConfig({ relayOnly });
+      const config = await getRTCConfig({ relayOnly, onWarning: message => { if (isCurrent()) setNetworkWarning(message); } });
       if (!isCurrent()) return;
       const peer = new Peer({ config, debug: 0 });
       peerRef.current = peer;
@@ -591,7 +604,7 @@ export function useFileReceiver() {
                   observedChunkSize = event.data.byteLength;
                   setActiveChunkSize(observedChunkSize);
                 }
-                if (chunks === 1 || session.received - lastAckBytes >= 256 * 1024) sendAck(chunks === 1);
+                sendAck(chunks === 1);
               }
             } catch (err) { fail(err.message || 'Invalid transfer data'); }
           };
@@ -629,7 +642,7 @@ export function useFileReceiver() {
   }, [stopConnection, setStatus]);
 
   return { status, ...metrics, speed: formatBytes(metrics.speed) + '/s', speedRaw: metrics.speed,
-    error, fileList, currentFileIndex, currentFileName, transferStats, peerDevice,
+    error, networkWarning, fileList, currentFileIndex, currentFileName, transferStats, peerDevice,
     networkMode, activeChunkSize, remotePaused, paused, togglePause, connect, cleanup, formatBytes };
 }
 
