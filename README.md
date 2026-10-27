@@ -42,6 +42,11 @@ This means DropBeam does not need an account or a personal file-storage system.
 - WebRTC
 - Vercel
 
+## Mobile networks and transfer recovery
+
+For relay setup, Jio/Airtel/Vi checks, and transfer regression tests, see
+[Transfer reliability and mobile networks](docs/transfer-troubleshooting.md).
+
 ## 🚀 Getting Started
 
 ### Prerequisites

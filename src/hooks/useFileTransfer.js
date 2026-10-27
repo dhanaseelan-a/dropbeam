@@ -1,14 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
-// ===== PERFORMANCE CONSTANTS =====
-const CHUNK_SIZE = 256 * 1024;        // 256KB — Fixed max for maximum throughput (auto steps down if rejected)
-const MAX_CHUNK  = 256 * 1024;        // 256KB limit
-const BUF_HI     = 8 * 1024 * 1024;   // 8MB — Maximize SCTP Congestion Window for 500Mbps+ WiFi
-const BUF_LO     = 2 * 1024 * 1024;   // 2MB — Low watermark
-const READ_AHEAD = 16;                // Read 4MB from disk at a time (256KB × 16)
-const ACK_INTERVAL = 200;             // Receiver ACK fallback interval (ms)
-const UI_INTERVAL  = 200;             // Sender UI throttle (ms)
+import { CHUNK_SIZE, createFilePump, ReceiveSession, resumePosition } from '../lib/transferProtocol';
+import { getRTCConfig, detectNetwork } from '../lib/rtcConfig';
 
 const NETWORK_MODES = {
   lan:      { label: 'LAN / Hotspot', icon: '🔌', color: '#22c55e', detail: 'Same network' },
@@ -22,15 +16,6 @@ const CHUNK_TIERS = {
   normal: { size: 128 * 1024,  label: 'Normal', bufHi: 2 * 1024 * 1024,  ahead: 8 },
   fast:   { size: 256 * 1024,  label: 'Fast',   bufHi: 2 * 1024 * 1024,  ahead: 8 },
 };
-
-// ===== ADAPTIVE CHUNK SIZING =====
-// Dynamically scales chunk size based on true network speed.
-function getAdaptiveChunk(bytesPerSec) {
-  if (!bytesPerSec || bytesPerSec <= 0) return CHUNK_SIZE;
-  const kbps = bytesPerSec / 1024;
-  if (kbps < 2000) return CHUNK_SIZE;      // < 2 MB/s
-  return MAX_CHUNK;                        // > 2 MB/s
-}
 
 // ===== SPEED LABEL =====
 function getSpeedLabel(bytesPerSec) {
@@ -103,691 +88,290 @@ function playDone() {
     g.gain.setValueAtTime(0.08, ctx.currentTime);
     g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
     o.start(ctx.currentTime); o.stop(ctx.currentTime + 0.4);
-  } catch (e) {}
+  } catch { /* Completion audio is optional. */ }
 }
 
-const ICE = [
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-];
+function getDC(conn) { return conn?.dataChannel || conn?._dc; }
 
-function getDC(conn) {
-  return conn.dataChannel || conn._dc;
+function dcSendJSON(dc, message) {
+  if (dc?.readyState !== 'open') return;
+  try { dc.send(JSON.stringify(message)); }
+  catch { /* ACKs repeat; closed channels are handled by connection recovery. */ }
 }
-
-function dcSendJSON(dc, obj) {
-  if (dc && dc.readyState === 'open') {
-    dc.send(JSON.stringify(obj));
-  }
-}
-
-// ===== NETWORK DETECT =====
-async function detectNetwork(conn) {
-  const r = { mode: 'internet' };
-  try {
-    const pc = conn.peerConnection || conn._pc;
-    if (!pc) return r;
-    const stats = await pc.getStats();
-    let lt = '', rt = '';
-    let lId = null, rId = null;
-    stats.forEach((s) => {
-      if (s.type === 'candidate-pair' && (s.state === 'succeeded' || s.selected)) {
-        lId = s.localCandidateId; rId = s.remoteCandidateId;
-      }
-    });
-    stats.forEach((s) => {
-      if (s.type === 'local-candidate' && s.id === lId) lt = s.candidateType || '';
-      if (s.type === 'remote-candidate' && s.id === rId) rt = s.candidateType || '';
-    });
-    if (lt === 'relay' || rt === 'relay') r.mode = 'relay';
-    else if (lt === 'host' && rt === 'host') r.mode = 'lan';
-    else if (lt === 'host' || rt === 'host') r.mode = 'wifi';
-    else r.mode = 'internet';
-  } catch (e) {}
-  return r;
-}
-
-// ===== PAUSE =====
-// Waits while local OR remote pause is active
-async function waitIfPaused(pausedRef, destroyedRef, remotePausedFn) {
-  const isPaused = () => pausedRef.current || (remotePausedFn && remotePausedFn());
-  if (!isPaused()) return;
-  await new Promise((resolve) => {
-    const check = () => {
-      if (!isPaused() || destroyedRef.current) resolve();
-      else setTimeout(check, 50);
-    };
-    check();
-  });
-}
-
-// ===== BACKPRESSURE =====
-// Waits until dc.bufferedAmount drops to BUF_LO.
-// Uses the bufferedamountlow EVENT as primary, with a polling safety net.
-function waitForDrain(dc) {
-  if (!dc || dc.readyState !== 'open') return Promise.resolve();
-  if (dc.bufferedAmount <= BUF_LO) return Promise.resolve();
-
-  return new Promise((resolve) => {
-    dc.bufferedAmountLowThreshold = BUF_LO;
-
-    let resolved = false;
-    const done = () => {
-      if (resolved) return;
-      resolved = true;
-      dc.removeEventListener('bufferedamountlow', onLow);
-      clearInterval(pollId);
-      resolve();
-    };
-
-    const onLow = () => done();
-    dc.addEventListener('bufferedamountlow', onLow);
-
-    // Safety poll every 16ms — align with frame timing
-    const pollId = setInterval(() => {
-      if (!dc || dc.readyState !== 'open' || dc.bufferedAmount <= BUF_LO) done();
-    }, 16);
-  });
-}
-
-// Returns true if buffer has room (below high watermark)
-function bufferHasRoom(dc) {
-  return dc && dc.readyState === 'open' && dc.bufferedAmount <= BUF_HI;
-}
-
 
 // ====== SENDER ======
 export function useFileSender() {
-  const [status, setStatus] = useState('idle');
+  const [status, setStatusState] = useState('idle');
   const [code, setCode] = useState('');
-  const [files, setFiles] = useState([]);
+  const [files, setFilesState] = useState([]);
   const [error, setError] = useState('');
   const [codeExpiry, setCodeExpiry] = useState(null);
   const [paused, setPaused] = useState(false);
   const [receivers, setReceivers] = useState([]);
-
   const peerRef = useRef(null);
-  const destroyedRef = useRef(false);
+  const generationRef = useRef(0);
   const statusRef = useRef('idle');
   const filesRef = useRef([]);
   const expiryRef = useRef(null);
+  const signalRetryRef = useRef(null);
   const pausedRef = useRef(false);
   const receiversRef = useRef([]);
-  const lastRestartRef = useRef(0);
+  const pendingRef = useRef(new Set());
+  const recoveryTimersRef = useRef(new Map());
 
-  const isTransferring = receivers.some(r => r.status === 'transferring');
-  useBeforeUnload(isTransferring || status === 'waiting');
-  useEffect(() => { statusRef.current = status; }, [status]);
-  useEffect(() => { filesRef.current = files; }, [files]);
-  useEffect(() => { pausedRef.current = paused; }, [paused]);
-
-  const updateReceiver = useCallback((id, updates) => {
-    setReceivers(prev => prev.map(r => r.id === id ? { ...r, ...updates } : r));
+  const setStatus = useCallback(value => { statusRef.current = value; setStatusState(value); }, []);
+  const setFiles = useCallback(value => {
+    filesRef.current = typeof value === 'function' ? value(filesRef.current) : value;
+    setFilesState(filesRef.current);
   }, []);
+  useBeforeUnload(status === 'waiting' || status === 'transferring');
 
-  // ---- TOGGLE PAUSE WITH SYNC ----
-  const togglePause = useCallback(() => {
-    setPaused(p => {
-      const newPaused = !p;
-      // Send pause/resume to all active receivers
-      receiversRef.current.forEach(r => {
-        try {
-          const dc = getDC(r.conn);
-          if (dc && dc.readyState === 'open') {
-            dcSendJSON(dc, { type: newPaused ? 'pause' : 'resume' });
-          }
-        } catch (e) {}
-      });
-      return newPaused;
-    });
-  }, []);
-
-  // ---- TRANSFER ENGINE (rewritten for event-driven speed & auto-resume) ----
-  const transferToReceiver = useCallback(async (receiverId, conn, filesToSend, startIndex = 0, startOffset = 0) => {
-    const dc = getDC(conn);
-    if (!dc || dc.readyState !== 'open') {
-      updateReceiver(receiverId, { status: 'error', error: 'Channel not open' });
-      return;
+  const stopConnections = useCallback(() => {
+    generationRef.current++;
+    clearTimeout(expiryRef.current);
+    clearTimeout(signalRetryRef.current);
+    expiryRef.current = null;
+    for (const receiver of receiversRef.current) {
+      receiver.pump?.cancel();
+      dcSendJSON(getDC(receiver.conn), { type: 'cancel' });
     }
-    dc.binaryType = 'arraybuffer';
-
-    const grandTotal = filesToSend.reduce((s, f) => s + f.size, 0);
-    const startTime = Date.now();
-    let globalBytesSent = filesToSend.slice(0, startIndex).reduce((s, f) => s + f.size, 0) + startOffset;
-    let chunksSent = 0;
-    let currentChunkSize = CHUNK_SIZE;
-    let lastSentChunkSize = currentChunkSize;
-    let maxAllowedChunkSize = MAX_CHUNK;
-    let receiverBytes = globalBytesSent;
-    let currentSpeed = 0;
-    let inFlightBytes = 0;
-    let transferDone = false; // flag to stop the progress timer
-    let progressTimer = null;
-    let lastAckTime = Date.now();
-
-    // Remote pause flag
-    conn._remotePaused = false;
-    conn._cancelled = false;
-
-    // ===== INCOMING MESSAGES FROM RECEIVER =====
-    dc.onmessage = (event) => {
-      if (typeof event.data === 'string') {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'ack') {
-            lastAckTime = Date.now();
-            if (msg.received != null) {
-              receiverBytes = Math.max(receiverBytes, msg.received);
-              inFlightBytes = globalBytesSent - receiverBytes;
-            }
-            // Forward receiver's progress/speed to UI
-            const updObj = { progress: msg.progress ?? 0, eta: msg.eta || '', etc: msg.etc || '' };
-            if (msg.speed > 0) {
-              updObj.speed = msg.speed;
-              updObj.speedLabel = getSpeedLabel(msg.speed);
-              currentSpeed = msg.speed; // Store speed perfectly for sender adaptive loop
-            }
-            updateReceiver(receiverId, updObj);
-          }
-          if (msg.type === 'cancel') {
-            conn._cancelled = true;
-            updateReceiver(receiverId, { status: 'cancelled', error: 'Cancelled by receiver' });
-          }
-          if (msg.type === 'pause') {
-            conn._remotePaused = true;
-            updateReceiver(receiverId, { remotePaused: true });
-          }
-          if (msg.type === 'resume') {
-            conn._remotePaused = false;
-            updateReceiver(receiverId, { remotePaused: false });
-          }
-          if (msg.type === 'device-info') {
-            updateReceiver(receiverId, { device: msg.device || '' });
-            if (msg.resumeIndex !== undefined && (msg.resumeOffset > 0 || msg.resumeIndex > 0)) {
-               // Ignore as it is handled by the connection open wrapper now
-            }
-          }
-        } catch (e) {}
-      }
-    };
-
-    // ===== STUCK DETECTOR WATCHDOG =====
-    const watchdog = setInterval(() => {
-      if (transferDone || destroyedRef.current || conn._cancelled) {
-         clearInterval(watchdog);
-         return;
-      }
-      if (Date.now() - lastAckTime > 5000 && dc.bufferedAmount > 0 && !pausedRef.current && !conn._remotePaused) {
-        if (Date.now() - lastRestartRef.current < 5000) return;
-        lastRestartRef.current = Date.now();
-        console.log("[DropBeam] Stuck detected → reconnecting sender full stack");
-        
-        // SENDER CLEANUP AND STATE TEARDOWN
-        conn._restarting = true;
-        isPumping = false;
-        if (dc) {
-           dc.onmessage = null;
-           if (dc._pumpHandler) {
-               dc.removeEventListener('bufferedamountlow', dc._pumpHandler);
-               dc._pumpHandler = null;
-           }
-        }
-        if (progressTimer) clearInterval(progressTimer);
-        clearInterval(watchdog);
-        
-        conn.close();
-        
-        // Force bidirectional recovery with extended padding (new ID generates safely)
-        setTimeout(() => {
-          if (!destroyedRef.current) {
-            initPeer();
-          }
-        }, 1500);
-      } else if (Date.now() - lastAckTime > 10000 && !pausedRef.current && !conn._remotePaused) {
-        // Hard timeout safety (independent of bufferedAmount)
-        if (Date.now() - lastRestartRef.current < 5000) return;
-        lastRestartRef.current = Date.now();
-        console.log("[DropBeam] Hard timeout → reconnecting");
-        
-        conn._restarting = true;
-        isPumping = false;
-        if (dc) {
-           dc.onmessage = null;
-           if (dc._pumpHandler) {
-               dc.removeEventListener('bufferedamountlow', dc._pumpHandler);
-               dc._pumpHandler = null;
-           }
-        }
-        if (progressTimer) clearInterval(progressTimer);
-        clearInterval(watchdog);
-        
-        conn.close();
-        
-        setTimeout(() => {
-          if (!destroyedRef.current) {
-            initPeer();
-          }
-        }, 1500);
-      }
-    }, 3000);
-
-    // ===== PROGRESS TIMER — runs every 200ms =====
-    // We strictly use receiver ACKs for speed, avoiding local dc.bufferedAmount glitches 
-    // that falsely reported 0 B/s on fast connections.
-    progressTimer = setInterval(() => {
-      if (transferDone) return;
-      
-      // Use receiverBytes for display to ensure perfect sync between Sender and Receiver pages
-      const displayBytes = receiverBytes;
-      const pct = grandTotal > 0 ? Math.min(99, Math.round((displayBytes / grandTotal) * 100)) : 0;
-      const totalChunks = Math.ceil(grandTotal / CHUNK_SIZE);
-
-      // Adaptive Check -> use the 'currentSpeed' harvested from receiver ACKs!
-      if (currentSpeed > 0) {
-        const nextChunkSize = Math.min(getAdaptiveChunk(currentSpeed), maxAllowedChunkSize);
-        if (nextChunkSize !== lastSentChunkSize) {
-          lastSentChunkSize = nextChunkSize;
-          currentChunkSize = nextChunkSize;
-          dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
-        }
-      }
-
-      updateReceiver(receiverId, {
-        bytesSent: displayBytes,
-        bytesTotal: grandTotal,
-        senderProgress: pct,
-        activeChunkSize: currentChunkSize,
-        chunksSent,
-        totalChunks,
-      });
-    }, 200);
-
-    // ===== INITIAL STATE =====
-    updateReceiver(receiverId, {
-      status: 'transferring', progress: 0, speed: 0, eta: '', etc: '',
-      activeChunkSize: currentChunkSize, speedLabel: getSpeedLabel(0),
-      chunksSent: 0, totalChunks: Math.ceil(grandTotal / CHUNK_SIZE),
-    });
-
-    dcSendJSON(dc, {
-      type: 'file-list',
-      files: filesToSend.map(f => ({ name: f.name, size: f.size, fileType: f.type })),
-      device: getDeviceName(),
-      chunkSize: currentChunkSize
-    });
-
-    // ===== EVENT-DRIVEN FILE PUMP ENGINE =====
-    let fi = startIndex;
-    let offset = startOffset;
-    let batchView = null;
-    let batchPos = 0;
-    let isPumping = false;
-
-    const startFinishWait = async () => {
-      // ===== CLEANUP PROGRESS TIMER =====
-      clearInterval(progressTimer);
-      transferDone = true;
-
-      // Check cancel BEFORE marking done
-      if (destroyedRef.current || conn._cancelled) {
-        if (dc) dc.onmessage = null;
-        setReceivers(prev => prev.map(r => {
-          if (r.id === receiverId && r.status !== 'cancelled') {
-            return { ...r, status: 'disconnected' };
-          }
-          return r;
-        }));
-        return;
-      }
-
-      // Wait for receiver confirmation
-      await new Promise((resolve) => {
-        if (receiverBytes >= grandTotal) return resolve();
-        
-        const finish = () => {
-          dc.removeEventListener('message', onMsg);
-          clearInterval(cancelCheck);
-          resolve();
-        };
-
-        const onMsg = (event) => {
-          if (typeof event.data === 'string') {
-            try {
-              const msg = JSON.parse(event.data);
-              if (msg.type === 'ack' && msg.received >= grandTotal) {
-                finish();
-              }
-              if (msg.type === 'cancel') {
-                conn._cancelled = true;
-                finish();
-              }
-            } catch (e) {}
-          }
-        };
-        
-        dc.addEventListener('message', onMsg);
-        
-        let lastRecv = receiverBytes;
-        let idleTime = 0;
-        
-        const cancelCheck = setInterval(() => {
-          if (conn._cancelled || destroyedRef.current || !dc || dc.readyState !== 'open') {
-            finish();
-            return;
-          }
-          
-          if (receiverBytes > lastRecv) {
-            lastRecv = receiverBytes;
-            idleTime = 0;
-          } else if (!pausedRef.current && !conn._remotePaused) {
-            idleTime += 500;
-          }
-          
-          if (idleTime > 60000) { // 60s idle timeout
-            finish();
-          }
-        }, 500);
-      });
-      
-      // Clean up
-      if (dc) dc.onmessage = null;
-
-      if (destroyedRef.current || conn._cancelled) {
-        setReceivers(prev => prev.map(r => {
-          if (r.id === receiverId && r.status !== 'cancelled') {
-            return { ...r, status: 'disconnected' };
-          }
-          return r;
-        }));
-        return;
-      }
-
-      dcSendJSON(dc, { type: 'all-done' });
-
-      const totalTime = (Date.now() - startTime) / 1000;
-      const completionTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-      updateReceiver(receiverId, {
-        status: 'done', progress: 100,
-        avgSpeed: grandTotal / totalTime,
-        totalTime, totalBytes: grandTotal,
-        speedLabel: getSpeedLabel(grandTotal / totalTime),
-        completionTime,
-      });
-      playDone();
-    }; // End of startFinishWait
-
-    // THE EVENT-DRIVEN PUMP TASK
-    const pumpData = async () => {
-      if (isPumping) return;
-      isPumping = true;
-      try {
-        while (true) {
-          if (destroyedRef.current || conn._cancelled || !dc || dc.readyState !== 'open') return;
-
-          if (fi >= filesToSend.length) {
-            return; // Loop completely finished
-          }
-
-          const file = filesToSend[fi];
-
-          // Application-Level Backpressure & Pause
-          if (globalBytesSent - receiverBytes > 12 * 1024 * 1024 || conn._remotePaused || pausedRef.current) {
-             setTimeout(pumpData, 50); // Yield and poll safely
-             return;
-          }
-
-          // Hardware Socket Backpressure
-          if (dc.bufferedAmount > BUF_HI) {
-             // Hardware limit reached. `bufferedamountlow` hardware event listener will resume us seamlessly!
-             return; 
-          }
-
-          if (!batchView) {
-             if (offset === 0) {
-               updateReceiver(receiverId, { currentFile: fi });
-               dcSendJSON(dc, { type: 'file-start', index: fi, name: file.name, size: file.size, fileType: file.type });
-             }
-             const batchBytes = currentChunkSize * READ_AHEAD;
-             const batchEnd = Math.min(offset + batchBytes, file.size);
-             if (batchEnd <= offset) {
-               dcSendJSON(dc, { type: 'file-end', index: fi });
-               fi++;
-               offset = 0;
-               continue;
-             }
-             const bigBuf = await file.slice(offset, batchEnd).arrayBuffer();
-             batchView = new Uint8Array(bigBuf);
-             batchPos = 0;
-          }
-
-          const chunkLen = Math.min(currentChunkSize, batchView.length - batchPos);
-          const chunk = batchView.subarray(batchPos, batchPos + chunkLen);
-
-          try {
-            dc.send(chunk);
-          } catch (err) {
-            if (err.name === 'TypeError' || String(err).includes('too large')) {
-               currentChunkSize = Math.max(16 * 1024, Math.floor(currentChunkSize / 2));
-               maxAllowedChunkSize = currentChunkSize;
-               lastSentChunkSize = currentChunkSize;
-               dcSendJSON(dc, { type: 'chunk-update', chunkSize: currentChunkSize });
-            }
-            return; // Let the next cycle retry the slice with updated buffers
-          }
-
-          batchPos += chunk.byteLength;
-          offset += chunk.byteLength;
-          globalBytesSent += chunk.byteLength;
-          inFlightBytes = globalBytesSent - receiverBytes;
-          chunksSent++;
-
-          if (batchPos >= batchView.length) {
-            batchView = null; // Clear view and load next buffer cycle
-          }
-
-          if (offset >= file.size) {
-            dcSendJSON(dc, { type: 'file-end', index: fi });
-            fi++;
-            offset = 0;
-            batchView = null;
-          }
-        }
-      } finally {
-        isPumping = false;
-        if (fi >= filesToSend.length && !transferDone) {
-           startFinishWait();
-        }
-      }
-    };
-
-    // Attach native hardware listener and bootstrap
-    dc.bufferedAmountLowThreshold = BUF_LO;
-    dc._pumpHandler = pumpData;
-    dc.addEventListener('bufferedamountlow', dc._pumpHandler);
-    pumpData();
-
-  }, [updateReceiver]);
-
-  // ---- PEER SETUP ----
-  const initPeer = useCallback((existingCode = null) => {
-    if (peerRef.current) peerRef.current.destroy();
-    destroyedRef.current = false;
-    setReceivers([]);
-    setCodeExpiry(null);
-    setPaused(false);
-    if (expiryRef.current) clearTimeout(expiryRef.current);
-
-    const myCode = existingCode || generateCode();
-    const peer = new Peer(myCode, {
-      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
-      debug: 0
-    });
-
-    peer.on('open', (id) => {
-      if (destroyedRef.current) return;
-      setCode(id);
-      setStatus('waiting');
-    });
-
-    peer.on('connection', (conn) => {
-      if (destroyedRef.current) return;
-      const receiverId = `r_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-
-      conn.on('open', async () => {
-        if (destroyedRef.current) return;
-
-        const newReceiver = {
-          id: receiverId, conn, device: '', status: 'connecting',
-          progress: 0, speed: 0, eta: '', etc: '', networkMode: null,
-          currentFile: 0, avgSpeed: 0, totalTime: 0, totalBytes: 0,
-          speedLabel: getSpeedLabel(0), remotePaused: false,
-          chunksSent: 0, totalChunks: 0,
-          senderProgress: 0, senderSpeed: 0, senderEta: '', senderEtc: '',
-          senderSpeedLabel: getSpeedLabel(0),
-        };
-        setReceivers(prev => [...prev, newReceiver]);
-        receiversRef.current.push(newReceiver);
-
-        const dc = getDC(conn);
-        if (dc) {
-          dc.binaryType = 'arraybuffer';
-          dc.onmessage = (event) => {
-            if (typeof event.data === 'string') {
-              try {
-                const msg = JSON.parse(event.data);
-                if (msg.type === 'device-info') updateReceiver(receiverId, { device: msg.device || '' });
-                if (msg.type === 'cancel') { conn._cancelled = true; updateReceiver(receiverId, { status: 'cancelled', error: 'Cancelled by receiver' }); }
-                if (msg.type === 'pause') { updateReceiver(receiverId, { remotePaused: true }); }
-                if (msg.type === 'resume') { updateReceiver(receiverId, { remotePaused: false }); }
-              } catch (e) {}
-            }
-          };
-        }
-
-        detectNetwork(conn).then(net => {
-          if (!destroyedRef.current) updateReceiver(receiverId, { networkMode: net.mode });
-        });
-
-        updateReceiver(receiverId, { status: 'connected' });
-        setStatus('transferring');
-
-        const currentFiles = filesRef.current;
-        if (currentFiles.length) {
-          // DO NOT start transfer immediately. Wait for device-info from Receiver.
-          // This allows Auto-Resumption offsets to be configured before pumping data!
-          const onFirstMsg = (event) => {
-             if (typeof event.data === 'string') {
-               try {
-                 const msg = JSON.parse(event.data);
-                 if (msg.type === 'device-info') {
-                    updateReceiver(receiverId, { device: msg.device || '' });
-                    dc.removeEventListener('message', onFirstMsg);
-                    
-                    // Resume lock to prevent duplicate transfers
-                    if (conn._restarting) return;
-                    conn._restarting = true;
-                    
-                    // If the device re-connected, scrub any matching old receiver to prevent ghost UI elements
-                    setReceivers(prev => {
-                       const exists = prev.some(r => r.id !== receiverId && r.status === 'disconnected' && r.device === msg.device);
-                       if (exists) return prev.filter(r => !(r.id !== receiverId && r.status === 'disconnected' && r.device === msg.device));
-                       return prev;
-                    });
-                    
-                    transferToReceiver(receiverId, conn, currentFiles, msg.resumeIndex || 0, msg.resumeOffset || 0);
-                 }
-               } catch (e) {}
-             }
-          };
-          dc.addEventListener('message', onFirstMsg);
-        }
-
-        const pc = conn.peerConnection || conn._pc;
-        if (pc) {
-          pc.addEventListener('iceconnectionstatechange', () => {
-             const state = pc.iceConnectionState;
-             if (state === 'failed' || state === 'disconnected') {
-                console.log("[DropBeam] Sender ICE State:", state);
-                if (state === 'failed') {
-                   conn.close(); // Force watchdog full reconnect
-                } else {
-                   try { pc.restartIce(); } catch(e) {}
-                }
-             }
-          });
-        }
-      });
-
-      conn.on('close', () => {
-        if (destroyedRef.current) return;
-        setReceivers(prev => prev.map(r => {
-          if (r.id === receiverId && r.status !== 'done' && r.status !== 'cancelled') return { ...r, status: 'disconnected' };
-          return r;
-        }));
-      });
-      conn.on('error', (err) => updateReceiver(receiverId, { status: 'error', error: err.message }));
-    });
-
-    peer.on('error', (err) => {
-      if (destroyedRef.current) return;
-      if (err.type === 'unavailable-id') { setTimeout(() => initPeer(), 100); return; }
-      setError(err.message || 'Connection failed'); setStatus('error');
-    });
-
-    peerRef.current = peer;
-  }, [transferToReceiver, updateReceiver]);
+    // Invalidate callbacks before destroying the peer (which emits close).
+    const peer = peerRef.current;
+    peerRef.current = null;
+    peer?.destroy();
+    for (const cancel of pendingRef.current) cancel();
+    pendingRef.current.clear();
+    for (const timer of recoveryTimersRef.current.values()) clearTimeout(timer);
+    recoveryTimersRef.current.clear();
+    receiversRef.current = [];
+  }, []);
 
   const cleanup = useCallback(() => {
-    destroyedRef.current = true;
-    if (expiryRef.current) clearTimeout(expiryRef.current);
-    receiversRef.current.forEach(r => {
-      try {
-        const dc = getDC(r.conn);
-        if (dc) {
-          dc.onmessage = null; // release closure refs
-          if (dc.readyState === 'open') dc.send(JSON.stringify({ type: 'cancel' }));
-        }
-        r.conn?.close();
-      } catch (e) {}
-    });
-    receiversRef.current = [];
-    if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null; }
-    setStatus('idle'); setCode(''); setFiles([]); setError(''); setReceivers([]); setPaused(false);
-  }, []);
-
+    stopConnections();
+    pausedRef.current = false;
+    setStatus('idle'); setCode(''); setFiles([]); setError('');
+    setReceivers([]); setPaused(false); setCodeExpiry(null);
+  }, [stopConnections, setStatus, setFiles]);
   useEffect(() => cleanup, [cleanup]);
 
-  const allTerminal = receivers.length > 0 && receivers.every(r => r.status === 'done' || r.status === 'error' || r.status === 'disconnected' || r.status === 'cancelled');
-  const anySuccess = receivers.some(r => r.status === 'done');
-  useEffect(() => {
-    if (allTerminal && statusRef.current === 'transferring') {
-      if (anySuccess) {
-        setStatus('done');
+  const updateReceiver = useCallback((id, updates) => {
+    receiversRef.current = receiversRef.current.map(r => r.id === id ? { ...r, ...updates } : r);
+    const next = receiversRef.current;
+    setReceivers([...next]);
+    const terminal = next.length && next.every(r => ['done', 'error', 'cancelled'].includes(r.status));
+    if (terminal && next.some(r => r.status === 'done')) {
+      setStatus('done');
+      if (!expiryRef.current) {
         setCodeExpiry(Date.now() + 10 * 60 * 1000);
-        expiryRef.current = setTimeout(() => { cleanup(); setCode(''); setCodeExpiry(null); }, 10 * 60 * 1000);
-      } else {
-        // All receivers failed or disconnected — don't show "done", show error
-        setStatus('error');
-        setError('Transfer failed — all receivers disconnected');
+        expiryRef.current = setTimeout(cleanup, 10 * 60 * 1000);
       }
+    } else if (terminal) {
+      setStatus('error');
+      setError('Transfer stopped — no receiver completed the transfer');
     }
-  }, [allTerminal, anySuccess, cleanup]);
+    // A disconnected receiver can reconnect using the same code; it is not a
+    // completed transfer, and must not tear down other receivers or the peer.
+  }, [cleanup, setStatus]);
 
-  return {
-    status, code, files, setFiles, error, codeExpiry,
-    paused, togglePause,
-    receivers, initPeer, cleanup, formatBytes
-  };
+  const togglePause = useCallback(() => {
+    pausedRef.current = !pausedRef.current;
+    setPaused(pausedRef.current);
+    for (const receiver of receiversRef.current) {
+      dcSendJSON(getDC(receiver.conn), { type: pausedRef.current ? 'pause' : 'resume' });
+      if (!pausedRef.current) receiver.pump?.wake();
+    }
+  }, []);
+
+  const initPeer = useCallback(async function initialize(existingCode = null) {
+    stopConnections();
+    const generation = generationRef.current;
+    const active = () => generation === generationRef.current;
+    const transferId = crypto.randomUUID();
+    pausedRef.current = false;
+    setReceivers([]); setCodeExpiry(null); setPaused(false); setError('');
+    setStatus('waiting');
+    setCode('');
+    const config = await getRTCConfig();
+    if (!active()) return;
+    const peer = new Peer(existingCode || generateCode(), { config, debug: 0 });
+    peerRef.current = peer;
+
+    peer.on('open', id => {
+      if (!active()) return;
+      clearTimeout(signalRetryRef.current);
+      setCode(id);
+    });
+    peer.on('disconnected', () => {
+      if (!active()) return;
+      clearTimeout(signalRetryRef.current);
+      signalRetryRef.current = setTimeout(() => {
+        if (active() && !peer.destroyed && peer.disconnected) peer.reconnect();
+      }, 1000);
+    });
+    peer.on('connection', conn => {
+      if (!active()) { conn.close(); return; }
+      let receiverId = `r_${crypto.randomUUID()}`;
+      let pump;
+      let handshakeTimer;
+      let disconnectedTimer;
+      let removeHandshake = () => {};
+      const dispose = () => {
+        clearTimeout(handshakeTimer);
+        clearTimeout(disconnectedTimer);
+        removeHandshake();
+        pump?.cancel();
+        pendingRef.current.delete(dispose);
+      };
+      pendingRef.current.add(dispose);
+      handshakeTimer = setTimeout(() => { dispose(); conn.close(); }, 30000);
+
+      conn.on('open', () => {
+        if (!active()) { dispose(); conn.close(); return; }
+        const dc = getDC(conn);
+        if (!dc) { dispose(); conn.close(); return; }
+        dc.binaryType = 'arraybuffer';
+        const handshake = event => {
+          if (typeof event.data !== 'string') return;
+          let message;
+          try { message = JSON.parse(event.data); } catch { return; }
+          if (message.type !== 'device-info') return;
+          removeHandshake();
+          clearTimeout(handshakeTimer);
+          if (!active()) return;
+          if (message.protocol !== 2) {
+            dcSendJSON(dc, { type: 'rejected', reason: 'Please refresh the receiving tab to update DropBeam, then reconnect with the same code.' });
+            handshakeTimer = setTimeout(() => { dispose(); conn.close(); }, 1000);
+            return;
+          }
+          // Device names are not unique. A stable receiver ID keeps two phones
+          // with the same browser separate and reuses only the reconnecting row.
+          const previous = receiversRef.current.find(r => message.receiverId && r.clientId === message.receiverId);
+          if (previous) {
+            receiverId = previous.id;
+            previous.pump?.cancel();
+            if (previous.conn !== conn) previous.conn.close();
+            clearTimeout(recoveryTimersRef.current.get(receiverId));
+            recoveryTimersRef.current.delete(receiverId);
+          }
+          const receiver = {
+            id: receiverId, clientId: message.receiverId, conn, device: message.device || '',
+            status: 'transferring', progress: 0, speed: 0, eta: '', etc: '', networkMode: null,
+            currentFile: 0, avgSpeed: 0, totalTime: 0, totalBytes: 0,
+            speedLabel: getSpeedLabel(0), remotePaused: !!message.paused,
+            chunksSent: 0, totalChunks: 0, senderProgress: 0,
+            senderSpeed: 0, senderEta: '', senderEtc: '', senderSpeedLabel: getSpeedLabel(0),
+          };
+          receiversRef.current = [...receiversRef.current.filter(r => r.id !== receiverId), receiver];
+          setReceivers([...receiversRef.current]);
+          clearTimeout(expiryRef.current); expiryRef.current = null;
+          setCodeExpiry(null); setError(''); setStatus('transferring');
+          const currentFiles = filesRef.current;
+          const resume = resumePosition(currentFiles, message, transferId);
+          const pc = conn.peerConnection || conn._pc;
+          pump = createFilePump({
+            channel: dc, files: currentFiles, transferId, device: getDeviceName(), resume,
+            maxMessageSize: pc?.sctp?.maxMessageSize,
+            isPaused: () => pausedRef.current || receiver.remotePaused,
+            onProgress: stats => {
+              if (!active()) return;
+              updateReceiver(receiverId, {
+                progress: stats.progress, senderProgress: stats.progress,
+                bytesSent: stats.received, bytesTotal: stats.total,
+                activeChunkSize: stats.chunkSize, chunksSent: stats.chunksSent,
+                totalChunks: currentFiles.reduce((n, f) => n + Math.ceil(f.size / stats.chunkSize), 0),
+                currentFile: stats.index, speed: stats.speed, speedLabel: getSpeedLabel(stats.speed),
+                eta: stats.eta, etc: stats.etc,
+              });
+            },
+            onControl: msg => {
+              if (!active()) return;
+              if (msg.type === 'pause' || msg.type === 'resume') {
+                receiver.remotePaused = msg.type === 'pause';
+                updateReceiver(receiverId, { remotePaused: receiver.remotePaused });
+                if (!receiver.remotePaused) pump?.wake();
+              }
+              if (msg.type === 'cancel') {
+                updateReceiver(receiverId, { status: 'cancelled' });
+                dispose(); conn.close();
+              }
+            },
+            onDone: stats => {
+              if (!active()) return;
+              const avgSpeed = stats.transferredBytes / stats.totalTime;
+              updateReceiver(receiverId, { ...stats, status: 'done', progress: 100,
+                senderProgress: 100, bytesSent: stats.totalBytes, avgSpeed,
+                speedLabel: getSpeedLabel(avgSpeed),
+                completionTime: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
+              });
+              dispose(); playDone();
+            },
+            onError: err => {
+              if (!active()) return;
+              updateReceiver(receiverId, { status: 'error', error: err.message });
+              dcSendJSON(dc, { type: 'rejected', reason: err.message });
+              dispose();
+            },
+            onDisconnect: () => {
+              if (!active()) return;
+              updateReceiver(receiverId, { status: 'disconnected' });
+              dispose(); conn.close();
+            },
+          });
+          receiver.pump = pump;
+          dcSendJSON(dc, { type: pausedRef.current ? 'pause' : 'resume' });
+          detectNetwork(conn).then(net => {
+            if (active() && getDC(conn)?.readyState === 'open') updateReceiver(receiverId, { networkMode: net.mode });
+          });
+        };
+        dc.addEventListener('message', handshake);
+        removeHandshake = () => dc.removeEventListener('message', handshake);
+      });
+      conn.on('iceStateChanged', state => {
+        clearTimeout(disconnectedTimer);
+        if (state === 'failed') { dispose(); conn.close(); }
+        else if (state === 'disconnected') {
+          // PeerJS does not renegotiate restartIce(). Replace only this data
+          // connection after a grace period and let the receiver resume it.
+          disconnectedTimer = setTimeout(() => { if (active()) { dispose(); conn.close(); } }, 10000);
+        }
+      });
+      conn.on('close', () => {
+        dispose();
+        if (!active()) return;
+        const current = receiversRef.current.find(r => r.id === receiverId);
+        if (current?.conn === conn && !['done', 'cancelled', 'error'].includes(current.status)) {
+          updateReceiver(receiverId, { status: 'disconnected' });
+          clearTimeout(recoveryTimersRef.current.get(receiverId));
+          recoveryTimersRef.current.set(receiverId, setTimeout(() => {
+            recoveryTimersRef.current.delete(receiverId);
+            const receiver = receiversRef.current.find(r => r.id === receiverId);
+            if (active() && receiver?.conn === conn && receiver.status === 'disconnected') {
+              updateReceiver(receiverId, { status: 'error', error: 'Receiver did not reconnect within five minutes' });
+            }
+          }, 5 * 60 * 1000));
+        }
+      });
+      conn.on('error', () => { dispose(); conn.close(); });
+    });
+    peer.on('error', err => {
+      if (!active()) return;
+      if (err.type === 'unavailable-id') { void initialize(); return; }
+      if (['network', 'disconnected', 'webrtc', 'peer-unavailable'].includes(err.type)) return;
+      setError(err.message || 'Connection failed'); setStatus('error');
+    });
+  }, [stopConnections, setStatus, updateReceiver]);
+
+  return { status, code, files, setFiles, error, codeExpiry, paused, togglePause,
+    receivers, initPeer, cleanup, formatBytes };
 }
 
+const emptyMetrics = () => ({ progress: 0, speed: 0, eta: '', etc: '',
+  bytesReceived: 0, bytesTotal: 0, chunksReceived: 0, speedLabel: getSpeedLabel(0) });
 
 // ====== RECEIVER ======
 export function useFileReceiver() {
-  const [status, setStatus] = useState('idle');
-  const [progress, setProgress] = useState(0);
-  const [speed, setSpeed] = useState(0);
-  const [eta, setEta] = useState('');
+  const [status, setStatusState] = useState('idle');
+  const [metrics, setMetrics] = useState(emptyMetrics);
   const [error, setError] = useState('');
   const [fileList, setFileList] = useState([]);
   const [currentFileIndex, setCurrentFileIndex] = useState(0);
@@ -796,476 +380,257 @@ export function useFileReceiver() {
   const [peerDevice, setPeerDevice] = useState('');
   const [networkMode, setNetworkMode] = useState(null);
   const [activeChunkSize, setActiveChunkSize] = useState(0);
-  const [speedLabel, setSpeedLabel] = useState(getSpeedLabel(0));
   const [remotePaused, setRemotePaused] = useState(false);
   const [paused, setPaused] = useState(false);
-  const [bytesReceived, setBytesReceived] = useState(0);
-  const [bytesTotal, setBytesTotal] = useState(0);
-  const [chunksReceived, setChunksReceived] = useState(0);
-  const chunksReceivedRef = useRef(0);
-
   const peerRef = useRef(null);
   const connRef = useRef(null);
   const dcRef = useRef(null);
-
-  const fileBufferRef = useRef(null);
-  const blobPartsRef = useRef([]);
-  const fileOffsetRef = useRef(0);
-  const chunksRef = useRef([]);
-  const fileTypeRef = useRef('');
-  const fileNameRef = useRef('');
-  const grandTotalRef = useRef(0);
-  const grandReceivedRef = useRef(0);
-  const startTimeRef = useRef(null);
-  const destroyedRef = useRef(false);
+  const generationRef = useRef(0);
   const statusRef = useRef('idle');
-  const fileListRef = useRef([]);
   const pausedRef = useRef(false);
+  const sessionRef = useRef(new ReceiveSession());
+  const disposeRef = useRef(() => {});
 
-  // ACK timer
-  const ackTimerRef = useRef(null);
-  // Speed tracking
-  const speedSamplesRef = useRef([]);
-  const lastSpeedRef = useRef(0);
-  const lastEtaRef = useRef('--:--');
-  const lastAckBytesRef = useRef(0); // Byte-based ACK trigger for max speed
-  const lastAckTimeRef = useRef(0);  // Prevent ACK spam at Gigabit speeds
-  // Track if we've sent the first ACK (send immediately on first data)
-  const firstDataRef = useRef(true);
+  const setStatus = useCallback(value => { statusRef.current = value; setStatusState(value); }, []);
+  useBeforeUnload(['receiving', 'connected', 'connecting', 'reconnecting'].includes(status));
 
-  // UI batching
-  const rafRef = useRef(null);
-  const [etc, setEtc] = useState('');
-  const pendingUIRef = useRef({ progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null, etc: null, chunksReceived: null });
-
-  const isTransferring = status === 'receiving' || status === 'connected';
-  useBeforeUnload(isTransferring);
-  useEffect(() => { statusRef.current = status; }, [status]);
-  useEffect(() => { pausedRef.current = paused; }, [paused]);
-
-  const flushUI = useCallback(() => {
-    const p = pendingUIRef.current;
-    if (p.progress !== null) setProgress(p.progress);
-    if (p.speed !== null) setSpeed(p.speed);
-    if (p.eta !== null) setEta(p.eta);
-    if (p.speedLabel !== null) setSpeedLabel(p.speedLabel);
-    if (p.bytesReceived !== null) setBytesReceived(p.bytesReceived);
-    if (p.bytesTotal !== null) setBytesTotal(p.bytesTotal);
-    if (p.etc !== null) setEtc(p.etc);
-    if (p.chunksReceived !== null) setChunksReceived(p.chunksReceived);
-    pendingUIRef.current = { progress: null, speed: null, eta: null, speedLabel: null, bytesReceived: null, bytesTotal: null, etc: null, chunksReceived: null };
-    rafRef.current = null;
+  const stopConnection = useCallback(() => {
+    generationRef.current++;
+    disposeRef.current();
+    disposeRef.current = () => {};
+    const peer = peerRef.current;
+    peerRef.current = null; connRef.current = null; dcRef.current = null;
+    peer?.destroy();
   }, []);
-
-  const scheduleUI = useCallback((pct, spd, etaStr, spdLabel, received, total, etcStr, chunks) => {
-    pendingUIRef.current.progress = pct;
-    if (spd !== undefined) pendingUIRef.current.speed = spd;
-    if (etaStr !== undefined) pendingUIRef.current.eta = etaStr;
-    if (spdLabel !== undefined) pendingUIRef.current.speedLabel = spdLabel;
-    if (received !== undefined) pendingUIRef.current.bytesReceived = received;
-    if (total !== undefined) pendingUIRef.current.bytesTotal = total;
-    if (etcStr !== undefined) pendingUIRef.current.etc = etcStr;
-    if (chunks !== undefined) pendingUIRef.current.chunksReceived = chunks;
-    if (!rafRef.current) rafRef.current = requestAnimationFrame(flushUI);
-  }, [flushUI]);
-
-  // ---- Toggle pause with sync ----
-  const togglePause = useCallback(() => {
-    setPaused(p => {
-      const newPaused = !p;
-      const dc = dcRef.current;
-      if (dc && dc.readyState === 'open') {
-        dcSendJSON(dc, { type: newPaused ? 'pause' : 'resume' });
-      }
-      return newPaused;
-    });
-  }, []);
-
-  // ---- COMPUTE SPEED + SEND ACK ----
-  const sendAckNow = useCallback((force = false) => {
-    const dc = dcRef.current;
-    if (!dc || dc.readyState !== 'open') return;
-
-    const now = Date.now();
-    // Throttle ACK JSON spam to max ~30 times a second at extreme 50+ MB/s Wi-Fi speeds
-    if (!force && now - lastAckTimeRef.current < 33) return;
-    lastAckTimeRef.current = now;
-
-    const received = grandReceivedRef.current;
-    const total = grandTotalRef.current;
-
-    // Add speed sample
-    speedSamplesRef.current.push({ time: now, bytes: received });
-    while (speedSamplesRef.current.length > 2 && now - speedSamplesRef.current[0].time > 3000) {
-      speedSamplesRef.current.shift();
-    }
-
-    const oldest = speedSamplesRef.current[0];
-    let spd = 0;
-    if (oldest && now - oldest.time > 0) {
-      spd = (received - oldest.bytes) / ((now - oldest.time) / 1000);
-    }
-    lastSpeedRef.current = spd;
-
-    const rem = total - received;
-    const remainingSec = spd > 0 ? rem / spd : 0;
-    const etaStr = spd > 0 ? formatTime(remainingSec) : '--:--';
-    lastEtaRef.current = etaStr;
-
-    // Estimated completion time
-    const etcStr = spd > 0
-      ? new Date(Date.now() + remainingSec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
-      : '';
-
-    const pct = total > 0 ? (received >= total ? 100 : Math.min(99, Math.round((received / total) * 100))) : 0;
-    const spdLabel = getSpeedLabel(spd);
-    scheduleUI(pct, spd, etaStr, spdLabel, received, total, etcStr, chunksReceivedRef.current);
-
-    try {
-      dc.send(JSON.stringify({
-        type: 'ack', progress: pct,
-        received: received, speed: spd, eta: etaStr, etc: etcStr
-      }));
-    } catch (e) {}
-  }, [scheduleUI]);
-
-  const startAckTimer = useCallback(() => {
-    if (ackTimerRef.current) clearInterval(ackTimerRef.current);
-    ackTimerRef.current = setInterval(sendAckNow, ACK_INTERVAL);
-  }, [sendAckNow]);
-
-  const stopAckTimer = useCallback(() => {
-    if (ackTimerRef.current) { clearInterval(ackTimerRef.current); ackTimerRef.current = null; }
-  }, []);
-
-  // ---- Free all receive buffers ----
-  const freeBuffers = useCallback(() => {
-    fileBufferRef.current = null;
-    blobPartsRef.current = [];
-    fileOffsetRef.current = 0;
-    chunksRef.current = [];
-    grandReceivedRef.current = 0;
-    grandTotalRef.current = 0;
-    speedSamplesRef.current = [];
-    chunksReceivedRef.current = 0;
-    lastAckBytesRef.current = 0;
-  }, []);
-
-  // ---- PROCESS FILE CHUNK (hot path) ----
-  const processChunk = useCallback((data) => {
-    if (!data || data.byteLength === 0) return;
-
-    const buf = fileBufferRef.current;
-    if (buf) {
-      const view = (data instanceof Uint8Array) ? data : new Uint8Array(data);
-      const off = fileOffsetRef.current;
-      const len = Math.min(view.byteLength, buf.byteLength - off);
-      if (len > 0) {
-        buf.set(view.subarray(0, len), off);
-        fileOffsetRef.current += len;
-      }
-    } else {
-      chunksRef.current.push(data instanceof ArrayBuffer ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
-      // Flush to Blob to prevent V8 Out-Of-Memory limit crash (~1.4GB)
-      if (chunksRef.current.length >= 256) {
-        blobPartsRef.current.push(new Blob(chunksRef.current, { type: fileTypeRef.current }));
-        chunksRef.current = [];
-      }
-    }
-
-    grandReceivedRef.current += data.byteLength;
-    chunksReceivedRef.current += 1;
-
-    // Send ACK immediately if we crossed a 256KB threshold, 
-    // entirely bypassing Chrome's rigid 1-second 'background tab' setInterval throttle!
-    if (grandReceivedRef.current - lastAckBytesRef.current >= 256 * 1024) {
-      lastAckBytesRef.current = grandReceivedRef.current;
-      sendAckNow(false);
-    }
-
-    // On FIRST data chunk, send an immediate ACK so sender UI doesn't show 0 B
-    if (firstDataRef.current) {
-      firstDataRef.current = false;
-      lastAckBytesRef.current = grandReceivedRef.current;
-      sendAckNow(true);
-    }
-  }, [sendAckNow]);
-
-  const processChunkRef = useRef(processChunk);
-  useEffect(() => { processChunkRef.current = processChunk; }, [processChunk]);
-
-  // ---- HANDLE CONTROL MESSAGE ----
-  const handleControl = useCallback((msg) => {
-    if (!msg || !msg.type) return;
-
-    switch (msg.type) {
-      case 'file-list':
-        setFileList(msg.files || []);
-        fileListRef.current = msg.files || [];
-        setPeerDevice(msg.device || '');
-        setActiveChunkSize(msg.chunkSize || CHUNK_SIZE);
-        grandTotalRef.current = (msg.files || []).reduce((s, f) => s + f.size, 0);
-        grandReceivedRef.current = 0;
-        startTimeRef.current = Date.now();
-        speedSamplesRef.current = [{ time: Date.now(), bytes: 0 }];
-        firstDataRef.current = true;
-        lastAckBytesRef.current = 0;
-        setStatus('receiving');
-        startAckTimer();
-        break;
-
-      case 'tier-update':
-      case 'config-update':
-      case 'chunk-update':
-        if (msg.chunkSize) setActiveChunkSize(msg.chunkSize);
-        break;
-
-      case 'file-start': {
-        setCurrentFileIndex(msg.index);
-        setCurrentFileName(msg.name);
-        fileTypeRef.current = msg.fileType || 'application/octet-stream';
-        fileNameRef.current = msg.name;
-        fileBufferRef.current = null;
-        blobPartsRef.current = [];
-        fileOffsetRef.current = 0;
-        chunksRef.current = [];
-        const MAX_PREALLOC = 512 * 1024 * 1024;
-        const sz = msg.size || 0;
-        if (sz > 0 && sz <= MAX_PREALLOC) {
-          try { fileBufferRef.current = new Uint8Array(sz); } catch (e) { fileBufferRef.current = null; }
-        }
-        break;
-      }
-
-      case 'file-end': {
-        let blob;
-        if (fileBufferRef.current) {
-          blob = new Blob([fileBufferRef.current.subarray(0, fileOffsetRef.current)], { type: fileTypeRef.current });
-        } else {
-          if (chunksRef.current.length > 0) {
-            blobPartsRef.current.push(new Blob(chunksRef.current, { type: fileTypeRef.current }));
-          }
-          blob = new Blob(blobPartsRef.current, { type: fileTypeRef.current });
-        }
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = fileNameRef.current;
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
-        // Free file buffers immediately after saving
-        fileBufferRef.current = null;
-        blobPartsRef.current = [];
-        fileOffsetRef.current = 0;
-        chunksRef.current = [];
-        break;
-      }
-
-      case 'all-done': {
-        sendAckNow(true);
-        stopAckTimer();
-        const tt = (Date.now() - startTimeRef.current) / 1000;
-        const avgSpd = grandReceivedRef.current / tt;
-        const completionTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-        setTransferStats({
-          totalBytes: grandReceivedRef.current, totalTime: tt,
-          avgSpeed: avgSpd,
-          fileCount: fileListRef.current.length || 1,
-          speedLabel: getSpeedLabel(avgSpd),
-          completionTime,
-        });
-        setProgress(100);
-        setStatus('done');
-        setRemotePaused(false);
-        setPaused(false);
-        // Free all buffers on completion
-        freeBuffers();
-        playDone();
-        break;
-      }
-
-      case 'cancel':
-        stopAckTimer();
-        freeBuffers();
-        setRemotePaused(false);
-        setPaused(false);
-        setError('Transfer cancelled by sender');
-        setStatus('error');
-        break;
-
-      case 'pause':
-        setRemotePaused(true);
-        break;
-
-      case 'resume':
-        setRemotePaused(false);
-        break;
-
-      case 'rejected':
-        stopAckTimer();
-        freeBuffers();
-        setError(msg.reason || 'Rejected');
-        setStatus('error');
-        break;
-
-      default: break;
-    }
-  }, [sendAckNow, startAckTimer, stopAckTimer, freeBuffers]);
-
-  const handleControlRef = useRef(handleControl);
-  useEffect(() => { handleControlRef.current = handleControl; }, [handleControl]);
-
-  // ---- CONNECT ----
-  const codeRef = useRef('');
-  const connect = useCallback((code) => {
-    codeRef.current = code;
-    if (peerRef.current) peerRef.current.destroy();
-    destroyedRef.current = false;
-    setStatus('connecting');
-    setError('');
-    setNetworkMode(null);
-    setRemotePaused(false);
-    setPaused(false);
-
-    const peer = new Peer({
-      config: { iceServers: ICE, sdpSemantics: 'unified-plan', iceCandidatePoolSize: 10 },
-      debug: 0
-    });
-
-    peer.on('open', () => {
-      if (destroyedRef.current) return;
-
-      const conn = peer.connect(code.toUpperCase(), { serialization: 'raw', reliable: true });
-
-      conn.on('open', async () => {
-        if (destroyedRef.current) return;
-        setStatus('connected');
-        connRef.current = conn;
-
-        const dc = getDC(conn);
-        if (!dc) { setError('No data channel'); setStatus('error'); return; }
-
-        dc.binaryType = 'arraybuffer';
-        dcRef.current = dc;
-
-        dc.send(JSON.stringify({ 
-           type: 'device-info', 
-           device: getDeviceName(),
-           resumeIndex: currentFileIndex,
-           resumeOffset: grandReceivedRef.current
-        }));
-
-        dc.onmessage = (event) => {
-          if (destroyedRef.current) return;
-
-          if (typeof event.data === 'string') {
-            try { handleControlRef.current(JSON.parse(event.data)); }
-            catch (e) { console.warn('[DropBeam] Bad JSON'); }
-            return;
-          }
-
-          if (event.data instanceof ArrayBuffer) {
-            if (statusRef.current === 'receiving') {
-              processChunkRef.current(event.data);
-            }
-          }
-        };
-
-        detectNetwork(conn).then(net => {
-          if (!destroyedRef.current) setNetworkMode(net.mode);
-        });
-      });
-
-        if (peer.peerConnection) {
-          peer.peerConnection.addEventListener('iceconnectionstatechange', () => {
-             const state = peer.peerConnection.iceConnectionState;
-             if ((state === 'disconnected' || state === 'failed') && !destroyedRef.current && statusRef.current !== 'done') {
-                console.log("[DropBeam] Receiver ICE State:", state);
-                if (state === 'failed') {
-                   conn.close(); // Force native 3s reconnect loops
-                } else {
-                   try { peer.peerConnection.restartIce(); } catch(e) {}
-                   stopAckTimer();
-                   setRemotePaused(false);
-                   setPaused(false);
-                   setStatus('reconnecting');
-                }
-             }
-          });
-        }
-
-      conn.on('close', () => {
-        if (!destroyedRef.current && statusRef.current !== 'done') {
-          stopAckTimer();
-          setRemotePaused(false);
-          setPaused(false);
-          setStatus('reconnecting');
-          
-          // Reconnection attempt timer
-          setTimeout(() => {
-             if (!destroyedRef.current && statusRef.current === 'reconnecting') {
-                connect(codeRef.current);
-             }
-          }, 3000);
-          
-          // 5-minute memory purge timeout if we stay disconnected forever
-          setTimeout(() => {
-             if (statusRef.current === 'reconnecting') {
-                freeBuffers();
-                setError('Connection timed out permanently');
-                setStatus('error');
-             }
-          }, 5 * 60 * 1000);
-        }
-      });
-      conn.on('error', (e) => {
-        if (!destroyedRef.current) {
-          stopAckTimer();
-          freeBuffers();
-          setRemotePaused(false);
-          setPaused(false);
-          setError(e.message); setStatus('error');
-        }
-      });
-    });
-
-    peer.on('error', (err) => {
-      if (destroyedRef.current) return;
-      setError(err.type === 'peer-unavailable' ? 'Invalid code or sender offline' : err.message || 'Failed');
-      setStatus('error');
-    });
-
-    peerRef.current = peer;
-  }, [stopAckTimer, freeBuffers]);
 
   const cleanup = useCallback(() => {
-    destroyedRef.current = true;
-    stopAckTimer();
-    freeBuffers();
-    if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-    const dc = dcRef.current;
-    if (dc && dc.readyState === 'open') {
-      try { dc.send(JSON.stringify({ type: 'cancel' })); } catch (e) {}
-    }
-    dcRef.current = null;
-    if (connRef.current) { connRef.current.close(); connRef.current = null; }
-    if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null; }
-    setStatus('idle'); setError(''); setProgress(0); setSpeed(0); setEta(''); setEtc('');
+    dcSendJSON(dcRef.current, { type: 'cancel' });
+    stopConnection();
+    sessionRef.current.reset();
+    pausedRef.current = false;
+    setStatus('idle'); setError(''); setMetrics(emptyMetrics());
     setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
-    setTransferStats(null); setPeerDevice(null); setNetworkMode(null); setActiveChunkSize(0);
-    setSpeedLabel(getSpeedLabel(0)); setRemotePaused(false); setPaused(false);
-    setBytesReceived(0); setBytesTotal(0); setChunksReceived(0);
-  }, [stopAckTimer, freeBuffers]);
-
+    setTransferStats(null); setPeerDevice(''); setNetworkMode(null); setActiveChunkSize(0);
+    setRemotePaused(false); setPaused(false);
+  }, [stopConnection, setStatus]);
   useEffect(() => cleanup, [cleanup]);
 
-  return {
-    status, progress, speed: formatBytes(speed) + '/s', speedRaw: speed, eta, etc, error,
-    fileList, currentFileIndex, currentFileName,
-    transferStats, peerDevice, networkMode, activeChunkSize,
-    speedLabel, remotePaused, paused, togglePause,
-    bytesReceived, bytesTotal, chunksReceived,
-    connect, cleanup, formatBytes
-  };
+  const togglePause = useCallback(() => {
+    pausedRef.current = !pausedRef.current;
+    setPaused(pausedRef.current);
+    dcSendJSON(dcRef.current, { type: pausedRef.current ? 'pause' : 'resume' });
+  }, []);
+
+  const connect = useCallback(code => {
+    stopConnection();
+    const generation = generationRef.current;
+    const active = () => generation === generationRef.current;
+    const receiverId = crypto.randomUUID();
+    const session = sessionRef.current;
+    session.reset();
+    pausedRef.current = false;
+    setStatus('connecting'); setError(''); setNetworkMode(null);
+    setPaused(false); setRemotePaused(false); setMetrics(emptyMetrics());
+    setTransferStats(null); setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
+    let retryTimer, connectionTimer, disconnectTimer, ackTimer;
+    let attempts = 0, reconnectSince = 0, startedAt = 0, chunks = 0, observedChunkSize = 0;
+    let samples = [], lastAck = 0, lastUI = 0, lastAckBytes = 0;
+    let lastSpeed = 0, lastEta = '', lastEtc = '';
+    let removeMessage = () => {};
+    let relayOnly = false;
+    let attemptGeneration = 0;
+
+    const disposeAttempt = () => {
+      attemptGeneration++;
+      clearTimeout(connectionTimer); clearTimeout(disconnectTimer); clearInterval(ackTimer);
+      removeMessage(); removeMessage = () => {};
+      const peer = peerRef.current;
+      peerRef.current = null; connRef.current = null; dcRef.current = null;
+      peer?.destroy();
+    };
+    disposeRef.current = () => { clearTimeout(retryTimer); disposeAttempt(); };
+
+    const fail = message => {
+      if (!active()) return;
+      dcSendJSON(dcRef.current, { type: 'cancel' });
+      stopConnection();
+      session.reset();
+      setRemotePaused(false); setPaused(false); pausedRef.current = false;
+      setError(message); setStatus('error');
+    };
+
+    const sendAck = (force = false) => {
+      const dc = dcRef.current;
+      if (!dc || dc.readyState !== 'open') return;
+      const now = Date.now();
+      if (!force && now - lastAck < 50) return;
+      lastAck = now;
+      lastAckBytes = session.received;
+      samples.push({ time: now, bytes: session.received });
+      while (samples.length > 2 && now - samples[0].time > 3000) samples.shift();
+      const first = samples[0];
+      lastSpeed = now > first.time ? Math.max(0, (session.received - first.bytes) * 1000 / (now - first.time)) : 0;
+      const remaining = lastSpeed > 0 ? (session.total - session.received) / lastSpeed : 0;
+      lastEta = lastSpeed > 0 ? formatTime(remaining) : '--:--';
+      lastEtc = lastSpeed > 0 ? new Date(now + remaining * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '';
+      const progress = session.complete ? 100 : session.total ? Math.min(99, Math.round(session.received / session.total * 100)) : 0;
+      dcSendJSON(dc, { type: 'ack', received: session.received, progress, speed: lastSpeed, eta: lastEta, etc: lastEtc });
+      if (force || now - lastUI >= 200) {
+        lastUI = now;
+        setMetrics({ progress, speed: lastSpeed, eta: lastEta, etc: lastEtc,
+          bytesReceived: session.received, bytesTotal: session.total, chunksReceived: chunks,
+          speedLabel: getSpeedLabel(lastSpeed) });
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (!active() || session.complete || retryTimer) return;
+      disposeAttempt();
+      if (!reconnectSince) reconnectSince = Date.now();
+      if (Date.now() - reconnectSince > 5 * 60 * 1000 || attempts >= 8) {
+        fail('Unable to connect. Check both devices are online and that a working TURN relay is configured for mobile networks.');
+        return;
+      }
+      setStatus('reconnecting');
+      // The first attempt already gathers UDP, TCP and TLS candidates. Retry
+      // via relay only when direct negotiation failed; never force successful
+      // Wi-Fi/LAN sessions through a slower shared relay.
+      relayOnly = attempts % 2 === 1;
+      retryTimer = setTimeout(() => { retryTimer = null; void attempt(); }, Math.min(1000 * 2 ** Math.max(0, attempts - 1), 10000));
+    };
+
+    const handleControl = message => {
+      switch (message.type) {
+        case 'file-list': {
+          clearTimeout(connectionTimer);
+          const continuing = session.begin(message);
+          if (!continuing) { startedAt = Date.now(); chunks = 0; }
+          samples = [{ time: Date.now(), bytes: session.received }];
+          lastAckBytes = session.received;
+          setFileList(session.files); setPeerDevice(message.device || '');
+          setActiveChunkSize(message.chunkSize || CHUNK_SIZE);
+          setStatus('receiving');
+          clearInterval(ackTimer);
+          ackTimer = setInterval(() => sendAck(), 200);
+          sendAck(true);
+          break;
+        }
+        case 'file-start':
+          session.startFile(message);
+          setCurrentFileIndex(message.index); setCurrentFileName(message.name);
+          break;
+        case 'file-end': {
+          const { blob, name } = session.finishFile(message.index);
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement('a');
+          anchor.href = url; anchor.download = name;
+          document.body.appendChild(anchor); anchor.click(); anchor.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 10000);
+          sendAck(true);
+          break;
+        }
+        case 'all-done': {
+          session.finish();
+          sendAck(true);
+          // Completion means every file-end was processed and every byte was
+          // verified, not just that the sender's native buffer became empty.
+          dcSendJSON(dcRef.current, { type: 'complete', received: session.received });
+          clearInterval(ackTimer); clearTimeout(connectionTimer); clearTimeout(disconnectTimer);
+          const totalTime = Math.max(0.001, (Date.now() - startedAt) / 1000);
+          const avgSpeed = session.received / totalTime;
+          setTransferStats({ totalBytes: session.received, totalTime, avgSpeed,
+            fileCount: session.files.length, speedLabel: getSpeedLabel(avgSpeed),
+            completionTime: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) });
+          setStatus('done'); setRemotePaused(false); setPaused(false); pausedRef.current = false;
+          playDone();
+          break;
+        }
+        case 'tier-update': case 'config-update': case 'chunk-update':
+          if (message.chunkSize) setActiveChunkSize(message.chunkSize);
+          break;
+        case 'pause': setRemotePaused(true); break;
+        case 'resume': setRemotePaused(false); break;
+        case 'cancel': fail('Transfer cancelled by sender'); break;
+        case 'rejected': fail(message.reason || 'Transfer rejected'); break;
+        default: break;
+      }
+    };
+
+    async function attempt() {
+      if (!active() || session.complete) return;
+      attempts++;
+      const attemptId = ++attemptGeneration;
+      const isCurrent = () => active() && attemptId === attemptGeneration;
+      const config = await getRTCConfig({ relayOnly });
+      if (!isCurrent()) return;
+      const peer = new Peer({ config, debug: 0 });
+      peerRef.current = peer;
+      // This covers signalling, ICE and the file handshake, not just open data channels.
+      connectionTimer = setTimeout(() => { if (isCurrent()) scheduleReconnect(); }, 25000);
+      peer.on('open', () => {
+        if (!isCurrent()) return;
+        const conn = peer.connect(code.trim().toUpperCase(), { serialization: 'raw', reliable: true });
+        connRef.current = conn;
+        conn.on('open', () => {
+          if (!isCurrent()) return;
+          const dc = getDC(conn);
+          if (!dc) { scheduleReconnect(); return; }
+          dcRef.current = dc; dc.binaryType = 'arraybuffer';
+          setStatus('connected');
+          const onMessage = event => {
+            if (!isCurrent() || session.complete) return;
+            try {
+              if (typeof event.data === 'string') handleControl(JSON.parse(event.data));
+              else if (event.data instanceof ArrayBuffer) {
+                // Protocol state changes synchronously, unlike React state; the
+                // first chunk cannot be lost while React renders file-list.
+                session.append(event.data);
+                chunks++;
+                attempts = 0; reconnectSince = 0;
+                if (event.data.byteLength !== observedChunkSize && session.offset < session.currentFile.size) {
+                  observedChunkSize = event.data.byteLength;
+                  setActiveChunkSize(observedChunkSize);
+                }
+                if (chunks === 1 || session.received - lastAckBytes >= 256 * 1024) sendAck(chunks === 1);
+              }
+            } catch (err) { fail(err.message || 'Invalid transfer data'); }
+          };
+          dc.addEventListener('message', onMessage);
+          removeMessage = () => dc.removeEventListener('message', onMessage);
+          // Install the receive listener before the sender may respond.
+          dcSendJSON(dc, { type: 'device-info', protocol: 2, receiverId, device: getDeviceName(),
+            transferId: session.transferId, resumeIndex: session.index, resumeOffset: session.offset,
+            paused: pausedRef.current });
+          detectNetwork(conn).then(net => { if (isCurrent()) setNetworkMode(net.mode); });
+        });
+        conn.on('iceStateChanged', state => {
+          if (!isCurrent() || session.complete) return;
+          clearTimeout(disconnectTimer);
+          if (state === 'failed' || state === 'closed') scheduleReconnect();
+          else if (state === 'disconnected') {
+            disconnectTimer = setTimeout(() => { if (isCurrent()) scheduleReconnect(); }, 10000);
+          }
+        });
+        conn.on('close', () => { if (isCurrent()) scheduleReconnect(); });
+        conn.on('error', () => { if (isCurrent()) scheduleReconnect(); });
+      });
+      peer.on('error', err => {
+        if (!isCurrent()) return;
+        if (err.type === 'peer-unavailable' && !session.transferId) fail('Invalid code or sender offline');
+        else if (['browser-incompatible', 'invalid-id', 'invalid-key', 'ssl-unavailable'].includes(err.type)) fail(err.message);
+        else scheduleReconnect();
+      });
+      peer.on('disconnected', () => {
+        // An established WebRTC transfer does not need the signalling socket.
+        if (isCurrent() && dcRef.current?.readyState !== 'open') scheduleReconnect();
+      });
+    }
+    void attempt();
+  }, [stopConnection, setStatus]);
+
+  return { status, ...metrics, speed: formatBytes(metrics.speed) + '/s', speedRaw: metrics.speed,
+    error, fileList, currentFileIndex, currentFileName, transferStats, peerDevice,
+    networkMode, activeChunkSize, remotePaused, paused, togglePause, connect, cleanup, formatBytes };
 }
 
 export { formatBytes, formatTime, getDeviceName, NETWORK_MODES, CHUNK_TIERS, getSpeedLabel, CHUNK_SIZE };

@@ -25,7 +25,7 @@ function ReceivePage({ onTransferStateChange }) {
   }, [status, connect, autoConnecting]);
 
   useEffect(() => {
-    const active = status === 'receiving' || status === 'connected' || status === 'connecting';
+    const active = status === 'receiving' || status === 'connected' || status === 'connecting' || status === 'reconnecting';
     onTransferStateChange?.(active);
   }, [status, onTransferStateChange]);
 
@@ -62,8 +62,15 @@ function ReceivePage({ onTransferStateChange }) {
         </div>
       )}
 
-      {(status === 'connected' || status === 'receiving') && (
+      {(status === 'connected' || status === 'receiving' || status === 'reconnecting') && (
         <div className="glass-card slide-up">
+          {status === 'reconnecting' && (
+            <div style={{ textAlign: 'center' }}>
+              <div className="status-badge status-waiting">Connection interrupted — reconnecting...</div>
+              <p className="code-hint">Keep both tabs open. Received data is kept for resuming.</p>
+              <button className="ctrl-btn cancel" onClick={handleCancel}>✕ Cancel</button>
+            </div>
+          )}
           {peerDevice && <div className="device-badge" style={{ marginBottom: '0.75rem' }}>📱 Sender: {peerDevice}</div>}
 
           {net && status === 'connected' && fileList.length === 0 && (
