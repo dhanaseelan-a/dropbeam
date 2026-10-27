@@ -47,11 +47,19 @@ deadline so an unavailable endpoint cannot leave connection setup hanging.
 - Queue and retry Pause, Resume, handshake and completion messages instead of
   silently dropping them when a browser reports a full buffer. Repeat receiver
   pause state in acknowledgements and keep each side's pause independent.
-- Start with a 128 KB delivery window, adapt buffering to delivered speed and
-  acknowledgement latency, and start with 16 KB SCTP messages (up to 64 KB on
-  fast, low-latency paths within the browser's negotiated limit). This limits queued data
-  after Pause without imposing a fixed low-bandwidth cap on fast connections.
-  Bytes already accepted by the network still need to drain before stopping.
+- Keep up to 8 MB unacknowledged, with a separate 256 KB native send queue.
+  Let SCTP handle network congestion instead of deriving the delivery window
+  from displayed speed. Delayed ACKs, a slow startup or the zero-speed sample
+  after a pause must not prevent a faster connection from filling its capacity.
+  Messages start at 16 KB and can grow to 64 KB on fast paths within the
+  browser's negotiated limit. Speed samples shorter than 250 ms are ignored.
+- Negotiate a separate reliable SCTP stream for pause/resume, ACKs and cancel.
+  Sender Pause no longer waits behind the ordered file stream. Version pause
+  states so an older initial state or ACK cannot undo a newer button press.
+  Bytes already accepted by the network can still arrive; hold them and file
+  completion frames until both sides resume. The pending queue is bounded and
+  discarded on reconnect, which resumes from the last processed byte. Existing
+  clients without the auxiliary stream retain the original control path.
 - Schedule pending acknowledgements within 20 ms instead of waiting for a
   200 ms heartbeat when a partial batch is below the old byte threshold.
 - Use bounded read batches and Blob parts instead of allocating a contiguous
@@ -79,6 +87,11 @@ native ICE or TURN. An existing Chromium executable can be selected with
 The pause tests inject buffer errors into Pause and Resume, check that byte
 counters stop and restart (not just that a banner appears), and check that one
 receiver's pause does not stop another receiver or override the sender's pause.
+An additional browser test separates native-buffer drain from delayed file
+delivery: it pauses after megabytes have been accepted, checks that the receive
+session and downloads stay paused while in-flight bytes arrive, then verifies
+the resumed file's hash. Node checks cover delayed ACKs, stale speed feedback,
+bounded outstanding bytes, pending-frame limits and stale pause-state versions.
 
 The carrier check requires physical devices and a functioning TURN service;
 local tests do not reproduce a carrier's routing, CGNAT, IPv6 or firewall.

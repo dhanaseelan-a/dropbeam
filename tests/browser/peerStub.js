@@ -13,9 +13,11 @@ class DataChannel extends EventTarget {
   readyState = "connecting";
   bufferedAmount = 0;
   bufferedAmountLowThreshold = 0;
-  constructor(conn) {
+  constructor(conn, id = 0) {
     super();
     this.conn = conn;
+    this.id = id;
+    this.deliveryAt = 0;
   }
   send(data) {
     if (this.readyState !== "open")
@@ -52,7 +54,16 @@ class DataChannel extends EventTarget {
         /* Non-JSON controls are irrelevant to test instrumentation. */
       }
     } else window.__sentBytes += size;
-    this.conn.send({ kind: "data", data: copy, size });
+    const message = { kind: "data", data: copy, size, channelId: this.id };
+    // Model accepted network bytes separately from JS bufferedAmount. A slow
+    // ordered file stream must not hold up the independently negotiated one.
+    if (this.id === 0 && window.__fileDelay) {
+      this.deliveryAt = Math.max(this.deliveryAt, Date.now() + window.__fileDelay);
+      const delay = this.deliveryAt - Date.now();
+      setTimeout(() => { if (this.readyState === 'open') this.conn.send(message); }, delay);
+      queueMicrotask(() => this.delivered(size));
+      message.drained = true;
+    } else this.conn.send(message);
   }
   delivered(size) {
     const before = this.bufferedAmount;
@@ -63,6 +74,11 @@ class DataChannel extends EventTarget {
     )
       this.dispatchEvent(new Event("bufferedamountlow"));
   }
+  close() {
+    if (this.readyState === 'closed') return;
+    this.readyState = 'closed';
+    this.dispatchEvent(new Event('close'));
+  }
 }
 class Conn extends Events {
   constructor(peer, other, id) {
@@ -71,10 +87,22 @@ class Conn extends Events {
     this.peer = other;
     this.id = id;
     this.dataChannel = new DataChannel(this);
+    this.channels = new Map([[0, this.dataChannel]]);
     this.peerConnection = {
       sctp: { maxMessageSize: 262144 },
       close: () => this.close(),
       getStats: async () => new Map(),
+      createDataChannel: (label, options) => {
+        if (window.__legacyChannels) throw new Error('No auxiliary channel');
+        const channel = new DataChannel(this, options.id);
+        this.channels.set(options.id, channel);
+        queueMicrotask(() => {
+          if (this.dataChannel.readyState !== 'open') return;
+          channel.readyState = 'open';
+          channel.dispatchEvent(new Event('open'));
+        });
+        return channel;
+      },
     };
     window.__pcs.push(this.peerConnection);
   }
@@ -94,8 +122,7 @@ class Conn extends Events {
   close(notify = true) {
     if (this.dataChannel.readyState === "closed") return;
     if (notify) this.send({ kind: "close" });
-    this.dataChannel.readyState = "closed";
-    this.dataChannel.dispatchEvent(new Event("close"));
+    for (const channel of this.channels.values()) channel.close();
     this.emit("close");
   }
 }
@@ -122,13 +149,15 @@ export default class Peer extends Events {
         c.send({ kind: "accept" });
       } else if (m.kind === "accept") c?.open();
       else if (m.kind === "data" && c?.dataChannel.readyState === "open") {
+        const channel = c.channels.get(m.channelId ?? 0);
+        if (!channel || channel.readyState !== 'open') return;
         if (m.data instanceof ArrayBuffer)
           window.__rxBytes += m.data.byteLength;
-        c.dataChannel.dispatchEvent(
+        channel.dispatchEvent(
           new MessageEvent("message", { data: m.data }),
         );
-        c.send({ kind: "delivery", size: m.size });
-      } else if (m.kind === "delivery") c?.dataChannel.delivered(m.size);
+        if (!m.drained) c.send({ kind: "delivery", size: m.size, channelId: m.channelId });
+      } else if (m.kind === "delivery") c?.channels.get(m.channelId ?? 0)?.delivered(m.size);
       else if (m.kind === "close") c?.close(false);
     };
     queueMicrotask(() => this.emit("open", this.id));

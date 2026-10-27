@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { createFilePump, ReceiveSession, resumePosition, negotiatedChunkSize } from '../src/lib/transferProtocol.js';
+import { createFilePump, createReceiveQueue, MAX_IN_FLIGHT, ReceiveSession, resumePosition, negotiatedChunkSize } from '../src/lib/transferProtocol.js';
 import { getRTCConfig, detectNetwork } from '../src/lib/rtcConfig.js';
-import { sendControlMessage } from '../src/lib/controlMessages.js';
+import { applyPauseState, createControlChannel, sendControlMessage } from '../src/lib/controlMessages.js';
 
 class Channel extends EventTarget {
   readyState = 'open';
@@ -221,18 +221,68 @@ test('only the latest pause state and ACK wait in a full buffer', async () => {
   channel.close();
 });
 
-test('slow paths do not queue megabytes before the first delivery feedback', async () => {
+test('delayed ACKs and stale speed do not starve an available transport; outstanding bytes stay bounded', async () => {
   const channel = new Channel();
   let paused = false;
-  const pump = createFilePump({ channel, files: [makeFile('slow', 5 * 1024 * 1024)], transferId: 'x',
+  const pump = createFilePump({ channel, files: [makeFile('delayed-ack', 20 * 1024 * 1024)], transferId: 'x',
     isPaused: () => paused });
-  await delay(60);
-  const bytes = channel.messages.filter(m => typeof m !== 'string').reduce((n, m) => n + m.byteLength, 0);
-  assert.ok(bytes > 0 && bytes <= 128 * 1024, `unexpected initial queue: ${bytes}`);
+  const sent = () => channel.messages.filter(m => typeof m !== 'string').reduce((n, m) => n + m.byteLength, 0);
+  await delay(250);
+  const bytes = sent();
+  assert.ok(bytes >= 2 * 1024 * 1024, `delayed ACKs limited available transport to ${bytes} bytes`);
+  assert.ok(bytes <= MAX_IN_FLIGHT);
+  channel.reply({ type: 'ack', received: bytes, speed: 32 * 1024 });
+  await delay(250);
+  assert.ok(sent() >= bytes + 2 * 1024 * 1024, 'old display speed must not throttle newly available capacity');
+  assert.ok(sent() - bytes <= MAX_IN_FLIGHT);
   paused = true;
+  const pausedBytes = sent();
   await delay(30);
-  assert.equal(channel.messages.filter(m => typeof m !== 'string').reduce((n, m) => n + m.byteLength, 0), bytes);
+  assert.equal(sent(), pausedBytes);
   pump.cancel(); channel.close();
+});
+
+test('paused frames, file boundaries and completion stay ordered until both sides resume', () => {
+  let senderPaused = true, receiverPaused = false;
+  const consumed = [];
+  const queue = createReceiveQueue({ isPaused: () => senderPaused || receiverPaused, consume: data => consumed.push(data) });
+  const bytes = new Uint8Array([1, 2, 3]).buffer;
+  const frames = ['file-start', bytes, 'file-end', 'all-done'];
+  for (const frame of frames) queue.push(frame);
+  assert.deepEqual(consumed, []);
+  receiverPaused = true; senderPaused = false; queue.drain();
+  assert.deepEqual(consumed, []);
+  receiverPaused = false; queue.drain();
+  assert.deepEqual(consumed, frames);
+  senderPaused = true; queue.push(bytes); queue.clear();
+  senderPaused = false; queue.drain();
+  assert.deepEqual(consumed, frames, 'discard uncommitted queued data on reconnect');
+});
+
+test('paused receive queue has a hard memory bound', () => {
+  const queue = createReceiveQueue({ isPaused: () => true, consume: () => {}, maxBytes: 4 });
+  queue.push(new ArrayBuffer(4));
+  assert.throws(() => queue.push(new ArrayBuffer(1)), { name: 'QuotaExceededError' });
+});
+
+test('late cross-stream pause state and legacy ACKs cannot override newer controls', () => {
+  const state = { paused: false, version: -1 };
+  applyPauseState(state, { type: 'pause', pauseVersion: 3 });
+  for (const message of [{ type: 'resume', pauseVersion: 0 }, { type: 'ack', paused: false, pauseVersion: 2 }, { type: 'resume' }]) {
+    applyPauseState(state, message);
+    assert.equal(state.paused, true);
+  }
+  applyPauseState(state, { type: 'resume', pauseVersion: 4 });
+  assert.equal(state.paused, false);
+});
+
+test('auxiliary controls negotiate without replacing the PeerJS file channel', () => {
+  const calls = [];
+  const conn = { peerConnection: { createDataChannel: (...args) => { calls.push(args); return { id: args[1].id }; } } };
+  assert.equal(createControlChannel(conn, { id: 0 }, 2).id, 2);
+  assert.deepEqual(calls, [['dropbeam-controls', { negotiated: true, id: 2, ordered: true }]]);
+  assert.equal(createControlChannel(conn, { id: 2 }, 2), null);
+  assert.equal(createControlChannel({}, { id: 0 }, 2), null);
 });
 
 test('static deployment retains UDP, TCP and TLS relay candidates', async () => {

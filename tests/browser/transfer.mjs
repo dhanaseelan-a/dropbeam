@@ -82,8 +82,9 @@ async function senderWithFiles(selected = files) {
   const code = (await s.locator(".code-value").innerText()).trim();
   return { s, code };
 }
-async function receiver(code) {
+async function receiver(code, legacy = false) {
   const r = await page();
+  if (legacy) await r.addInitScript(() => { window.__legacyChannels = true; });
   const downloads = [];
   r.on("download", (d) => downloads.push(d));
   await r.goto(origin + "/?code=" + code);
@@ -116,6 +117,39 @@ try {
   await s.close();
   await r.close();
 
+  // Unlike the immediate BroadcastChannel path, this keeps accepted file data
+  // in transit after bufferedAmount drains. Sender controls must bypass it.
+  const backlog = await senderWithFiles([files[2]]);
+  await backlog.s.evaluate(() => { window.__slow = true; });
+  const held = await receiver(backlog.code);
+  await held.r.waitForFunction(() => window.__rxBytes > 200000);
+  await backlog.s.evaluate(() => { window.__fileDelay = 1500; window.__slow = false; });
+  await backlog.s.waitForFunction(() => window.__sentBytes > 2 * 1024 * 1024);
+  await backlog.s.getByRole('button', { name: '⏸ Pause', exact: true }).click();
+  await held.r.locator('.remote-pause-banner').waitFor({ timeout: 1000 });
+  const committed = await held.r.evaluate(() => window.__controls.filter(m => m.type === 'ack').at(-1).received);
+  await held.r.waitForTimeout(1800);
+  assert.ok(await held.r.evaluate(() => window.__rxBytes) > committed, 'test must deliver data that was already in flight');
+  assert.equal(await held.r.evaluate(() => window.__controls.filter(m => m.type === 'ack').at(-1).received), committed,
+    'paused data must be retained without advancing the receive session');
+  assert.equal(held.downloads.length, 0, 'file-end and completion must wait for Resume');
+  await backlog.s.evaluate(() => { window.__fileDelay = 0; });
+  await backlog.s.getByRole('button', { name: '▶ Resume', exact: true }).click();
+  await held.r.locator('.complete-title').waitFor({ timeout: 15000 });
+  await backlog.s.locator('.complete-title').waitFor({ timeout: 15000 });
+  await verifyDownloads(held.downloads, [files[2]]);
+  await backlog.s.close(); await held.r.close();
+  console.log('PASS: sender pause bypasses queued file data, holds byte progress and completion, resumes with exact file hash');
+
+  const fallback = await senderWithFiles([files[1]]);
+  await fallback.s.evaluate(() => { window.__legacyChannels = true; });
+  const legacy = await receiver(fallback.code, true);
+  await legacy.r.locator('.complete-title').waitFor();
+  await fallback.s.locator('.complete-title').waitFor();
+  await verifyDownloads(legacy.downloads, [files[1]]);
+  await fallback.s.close(); await legacy.r.close();
+  console.log('PASS: transfer still works when an auxiliary control stream is unavailable');
+
   const pair = await senderWithFiles();
   await pair.s.evaluate(() => {
     window.__slow = true;
@@ -135,6 +169,7 @@ try {
   assert.ok(await b.r.evaluate(() => window.__rxBytes) > otherBytes, 'other receiver must keep transferring');
   await a.r.getByRole("button", { name: "▶ Resume", exact: true }).click();
   await a.r.waitForFunction(previous => window.__rxBytes > previous + 65536, pausedBytes, { timeout: 3000 });
+  await a.r.getByRole('button', { name: '⏸ Pause', exact: true }).click();
   await a.r.evaluate(() => window.__pcs.at(-1).close());
   await a.r
     .getByText("Connection interrupted — reconnecting...")
@@ -143,6 +178,8 @@ try {
     (await pair.s.locator(".code-value").innerText()).trim(),
     pair.code,
   );
+  await a.r.waitForFunction(() => window.__controls.filter(m => m.type === 'device-info').length > 1);
+  await a.r.getByRole('button', { name: '▶ Resume', exact: true }).click();
   await a.r.locator(".complete-title").waitFor({ timeout: 60000 });
   await b.r.locator(".complete-title").waitFor({ timeout: 60000 });
   await pair.s.locator(".complete-title").waitFor({ timeout: 60000 });
