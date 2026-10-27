@@ -2,11 +2,13 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
 import { CHUNK_SIZE, createFilePump, createReceiveQueue, ReceiveSession, resumePosition } from '../lib/transferProtocol';
-import { getRTCConfig, detectNetwork } from '../lib/rtcConfig';
+import { getRTCConfig } from '../lib/rtcConfig';
+import { watchConnection } from '../lib/connectionDiagnostics';
 import { applyPauseState, createControlChannel, waitForControlChannel, sendControlMessage as dcSendJSON } from '../lib/controlMessages';
 
 const NETWORK_MODES = {
-  lan:      { label: 'LAN / Hotspot', icon: '🔌', color: '#22c55e', detail: 'Same network' },
+  unknown:  { label: 'Checking connection', icon: '⏳', color: '#71717a', detail: 'Route not reported yet' },
+  lan:      { label: 'Direct connection', icon: '🔌', color: '#22c55e', detail: 'Direct host candidates' },
   wifi:     { label: 'Same WiFi',     icon: '📶', color: '#3b82f6', detail: 'Same WiFi' },
   internet: { label: 'Internet',      icon: '🌐', color: '#f59e0b', detail: 'Internet P2P' },
   relay:    { label: 'Relay',         icon: '☁️', color: '#ef4444', detail: 'Relay server' },
@@ -213,6 +215,7 @@ export function useFileSender() {
       let receiverId = `r_${crypto.randomUUID()}`;
       let pump;
       let control;
+      let stopMonitoring = () => {};
       let handshakeTimer;
       let disconnectedTimer;
       let removeHandshake = () => {};
@@ -221,6 +224,7 @@ export function useFileSender() {
         clearTimeout(disconnectedTimer);
         removeHandshake();
         pump?.cancel();
+        stopMonitoring();
         control?.close();
         control = null;
         pendingRef.current.delete(dispose);
@@ -261,6 +265,7 @@ export function useFileSender() {
             status: 'transferring', progress: 0, speed: 0, eta: '', etc: '', networkMode: null,
             currentFile: 0, avgSpeed: 0, totalTime: 0, totalBytes: 0,
             speedLabel: getSpeedLabel(0), remotePaused: !!message.paused,
+            remoteHidden: message.hidden, remoteWasHidden: !!message.hidden,
             chunksSent: 0, totalChunks: 0, senderProgress: 0,
             senderSpeed: 0, senderEta: '', senderEtc: '', senderSpeedLabel: getSpeedLabel(0),
           };
@@ -302,6 +307,11 @@ export function useFileSender() {
             },
             onControl: msg => {
               if (!active()) return;
+              if (typeof msg.hidden === 'boolean' && receiver.remoteHidden !== msg.hidden) {
+                receiver.remoteHidden = msg.hidden;
+                receiver.remoteWasHidden ||= msg.hidden;
+                updateReceiver(receiverId, { remoteHidden: msg.hidden, remoteWasHidden: receiver.remoteWasHidden });
+              }
               if (msg.type === 'pause' || msg.type === 'resume' || (msg.type === 'ack' && typeof msg.paused === 'boolean')) {
                 const nextPaused = msg.paused;
                 if (receiver.remotePaused !== nextPaused) {
@@ -340,8 +350,12 @@ export function useFileSender() {
           receiver.pump = pump;
           updateReceiver(receiverId, { pump, control });
           dcSendJSON(control || dc, { type: pausedRef.current ? 'pause' : 'resume', pauseVersion: pauseVersionRef.current });
-          detectNetwork(conn).then(net => {
-            if (active() && getDC(conn)?.readyState === 'open') updateReceiver(receiverId, { networkMode: net.mode });
+          stopMonitoring = watchConnection(conn, info => {
+            if (active() && dc.readyState === 'open') updateReceiver(receiverId, {
+              networkMode: info.mode, connectionInfo: info, flowInfo: pump?.diagnostics(),
+            });
+          }, {
+            onVisibility: hidden => dcSendJSON(control || dc, { type: 'page-state', hidden }),
           });
         };
         dc.addEventListener('message', handshake);
@@ -401,6 +415,9 @@ export function useFileReceiver() {
   const [transferStats, setTransferStats] = useState(null);
   const [peerDevice, setPeerDevice] = useState('');
   const [networkMode, setNetworkMode] = useState(null);
+  const [connectionInfo, setConnectionInfo] = useState(null);
+  const [remoteHidden, setRemoteHidden] = useState(null);
+  const [remoteWasHidden, setRemoteWasHidden] = useState(false);
   const [activeChunkSize, setActiveChunkSize] = useState(0);
   const [remotePaused, setRemotePaused] = useState(false);
   const [paused, setPaused] = useState(false);
@@ -438,6 +455,7 @@ export function useFileReceiver() {
     setStatus('idle'); setError(''); setMetrics(emptyMetrics());
     setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
     setTransferStats(null); setPeerDevice(''); setNetworkMode(null); setActiveChunkSize(0);
+    setConnectionInfo(null); setRemoteHidden(null); setRemoteWasHidden(false);
     setRemotePaused(false); setPaused(false); setNetworkWarning('');
   }, [stopConnection, setStatus]);
   useEffect(() => cleanup, [cleanup]);
@@ -461,6 +479,7 @@ export function useFileReceiver() {
     pauseVersionRef.current = 0;
     senderPauseRef.current = { paused: false, version: -1 };
     setStatus('connecting'); setError(''); setNetworkMode(null);
+    setConnectionInfo(null); setRemoteHidden(null); setRemoteWasHidden(false);
     setPaused(false); setRemotePaused(false); setMetrics(emptyMetrics());
     setTransferStats(null); setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
     let retryTimer, connectionTimer, disconnectTimer, ackTimer, ackDelayTimer;
@@ -468,6 +487,7 @@ export function useFileReceiver() {
     let samples = [], lastAck = 0, lastUI = 0;
     let lastSpeed = 0, lastEta = '', lastEtc = '';
     let removeMessage = () => {};
+    let stopMonitoring = () => {};
     let receiveQueue;
     let relayOnly = false;
     let attemptGeneration = 0;
@@ -477,6 +497,7 @@ export function useFileReceiver() {
       clearTimeout(connectionTimer); clearTimeout(disconnectTimer); clearInterval(ackTimer);
       clearTimeout(ackDelayTimer); ackDelayTimer = null;
       removeMessage(); removeMessage = () => {};
+      stopMonitoring(); stopMonitoring = () => {};
       receiveQueue?.clear(); receiveQueue = null;
       pauseChangedRef.current = () => {};
       const peer = peerRef.current;
@@ -524,7 +545,8 @@ export function useFileReceiver() {
       }
       const progress = session.complete ? 100 : session.total ? Math.min(99, Math.round(session.received / session.total * 100)) : 0;
       dcSendJSON(dc, { type: 'ack', received: session.received, progress, speed: lastSpeed, eta: lastEta, etc: lastEtc,
-        paused: pausedRef.current, pauseVersion: pauseVersionRef.current });
+        paused: pausedRef.current, pauseVersion: pauseVersionRef.current,
+        hidden: document.visibilityState === 'hidden' });
       if (updateUI) {
         lastUI = now;
         setMetrics({ progress, speed: lastSpeed, eta: lastEta, etc: lastEtc,
@@ -586,6 +608,7 @@ export function useFileReceiver() {
           dcSendJSON(controlRef.current || dcRef.current, { type: 'complete', received: session.received });
           clearInterval(ackTimer); clearTimeout(connectionTimer); clearTimeout(disconnectTimer);
           clearTimeout(ackDelayTimer); ackDelayTimer = null;
+          stopMonitoring();
           const totalTime = Math.max(0.001, (Date.now() - startedAt) / 1000);
           const avgSpeed = session.received / totalTime;
           setTransferStats({ totalBytes: session.received, totalTime, avgSpeed,
@@ -602,6 +625,12 @@ export function useFileReceiver() {
           applyPauseState(senderPauseRef.current, message);
           setRemotePaused(senderPauseRef.current.paused);
           pauseChangedRef.current();
+          break;
+        case 'page-state':
+          if (typeof message.hidden === 'boolean') {
+            setRemoteHidden(message.hidden);
+            if (message.hidden) setRemoteWasHidden(true);
+          }
           break;
         case 'cancel': fail('Transfer cancelled by sender'); break;
         case 'rejected': fail(message.reason || 'Transfer rejected'); break;
@@ -670,7 +699,7 @@ export function useFileReceiver() {
                   selectControl();
                   return;
                 }
-                if (['file-list', 'pause', 'resume', 'cancel', 'rejected'].includes(message.type)) {
+                if (['file-list', 'pause', 'resume', 'cancel', 'rejected', 'page-state'].includes(message.type)) {
                   handleControl(message); return;
                 }
               }
@@ -698,8 +727,13 @@ export function useFileReceiver() {
           dcSendJSON(dc, { type: 'device-info', protocol: 2, receiverId, device: getDeviceName(),
             transferId: session.transferId, resumeIndex: session.index, resumeOffset: session.offset,
             paused: pausedRef.current, pauseVersion: pauseVersionRef.current,
+            hidden: document.visibilityState === 'hidden',
             controlChannelId: control?.id });
-          detectNetwork(conn).then(net => { if (isCurrent()) setNetworkMode(net.mode); });
+          stopMonitoring = watchConnection(conn, info => {
+            if (isCurrent()) { setNetworkMode(info.mode); setConnectionInfo(info); }
+          }, {
+            onVisibility: hidden => dcSendJSON(controlRef.current || dc, { type: 'page-state', hidden }),
+          });
         });
         conn.on('iceStateChanged', state => {
           if (!isCurrent() || session.complete) return;
@@ -728,7 +762,8 @@ export function useFileReceiver() {
 
   return { status, ...metrics, speed: formatBytes(metrics.speed) + '/s', speedRaw: metrics.speed,
     error, networkWarning, fileList, currentFileIndex, currentFileName, transferStats, peerDevice,
-    networkMode, activeChunkSize, remotePaused, paused, togglePause, connect, cleanup, formatBytes };
+    networkMode, connectionInfo, remoteHidden, remoteWasHidden,
+    activeChunkSize, remotePaused, paused, togglePause, connect, cleanup, formatBytes };
 }
 
 export { formatBytes, formatTime, getDeviceName, NETWORK_MODES, CHUNK_TIERS, getSpeedLabel, CHUNK_SIZE };

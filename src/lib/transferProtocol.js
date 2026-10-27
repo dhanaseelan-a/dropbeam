@@ -339,5 +339,10 @@ export function createFilePump({
     controlChannel.addEventListener('error', handleClose);
   }
   wake();
-  return { wake, cancel: dispose };
+  return { wake, cancel: dispose, diagnostics: () => ({
+    outstandingBytes: sent - received,
+    waitingFor: stopped ? 'stopped' : isPaused() || remotePause.paused ? 'paused' :
+      finishing ? 'completion' : channel.bufferedAmount >= SEND_BUFFER ? 'send-buffer' :
+      sent - received >= MAX_IN_FLIGHT ? 'acknowledgement' : pumping ? 'file-read-or-send' : 'ready',
+  }) };
 }

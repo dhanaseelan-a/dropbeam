@@ -133,6 +133,43 @@ try {
   assert.equal(await held.r.evaluate(() => window.__controls.filter(m => m.type === 'ack').at(-1).received), committed,
     'paused data must be retained without advancing the receive session');
   assert.equal(held.downloads.length, 0, 'file-end and completion must wait for Resume');
+  await backlog.s.evaluate(() => {
+    window.__rtcStats = [
+      ['transport', { type: 'transport', selectedCandidatePairId: 'chosen' }],
+      ['chosen', { type: 'candidate-pair', localCandidateId: 'local', remoteCandidateId: 'remote', currentRoundTripTime: 0.12 }],
+      ['local', { candidateType: 'relay', protocol: 'udp', relayProtocol: 'tls', address: '192.0.2.1' }],
+      ['remote', { candidateType: 'host', protocol: 'udp' }],
+    ];
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => window.__hiddenForTest ? 'hidden' : 'visible' });
+    window.__hiddenForTest = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await held.r.getByText(/Sending page is in the background/).waitFor();
+  await backlog.s.locator('.network-chip-sm').getByText('Relay', { exact: false }).waitFor();
+  await backlog.s.locator('.connection-details summary').click();
+  await backlog.s.getByText('UDP · Relay TLS', { exact: true }).waitFor();
+  await backlog.s.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('Clipboard unavailable'); } } });
+  });
+  await backlog.s.getByRole('button', { name: 'Copy diagnostics', exact: true }).click();
+  const report = JSON.parse(await backlog.s.getByRole('textbox', { name: 'Connection diagnostic report' }).inputValue());
+  assert.equal(report.route, 'relay');
+  assert.equal(report.localRelayProtocol, 'tls');
+  assert.equal(report.localPageHidden, true);
+  assert.ok(!JSON.stringify(report).includes('192.0.2.1'));
+  if (process.env.DROPBEAM_SCREENSHOT_DIR) {
+    await mkdir(process.env.DROPBEAM_SCREENSHOT_DIR, { recursive: true });
+    await backlog.s.setViewportSize({ width: 390, height: 844 });
+    await backlog.s.locator('.connection-details-wrap').screenshot({ path: join(process.env.DROPBEAM_SCREENSHOT_DIR, 'connection-details.png') });
+  }
+  await backlog.s.evaluate(() => {
+    window.__rtcStats[2][1] = { candidateType: 'host', protocol: 'udp' };
+    window.__hiddenForTest = false;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await backlog.s.locator('.network-chip-sm').getByText('Direct connection', { exact: false }).waitFor();
+  await held.r.locator('.background-hint').waitFor({ state: 'hidden' });
+  console.log('PASS: live route changes, TURN/TLS details, remote background notice and safe clipboard fallback');
   await backlog.s.evaluate(() => { window.__fileDelay = 0; });
   await backlog.s.getByRole('button', { name: '▶ Resume', exact: true }).click();
   await held.r.locator('.complete-title').waitFor({ timeout: 15000 });
@@ -157,6 +194,7 @@ try {
   const a = await receiver(pair.code);
   const b = await receiver(pair.code);
   await a.r.waitForFunction(() => window.__rxBytes > 800000);
+  await b.r.waitForFunction(() => window.__rxBytes > 100000);
   await a.r.evaluate(() => { window.__failControls = ['pause', 'resume']; });
   await a.r.getByRole("button", { name: "⏸ Pause", exact: true }).click();
   await a.r.locator(".pause-banner").waitFor();
@@ -166,7 +204,8 @@ try {
   const otherBytes = await b.r.evaluate(() => window.__rxBytes);
   await a.r.waitForTimeout(400);
   assert.equal(await a.r.evaluate(() => window.__rxBytes), pausedBytes, 'paused receiver must stop receiving bytes');
-  assert.ok(await b.r.evaluate(() => window.__rxBytes) > otherBytes, 'other receiver must keep transferring');
+  await b.r.waitForFunction(previous => window.__rxBytes > previous, otherBytes, { timeout: 3000 });
+  assert.equal(await a.r.evaluate(() => window.__rxBytes), pausedBytes, 'one receiver must remain paused while the other progresses');
   await a.r.getByRole("button", { name: "▶ Resume", exact: true }).click();
   await a.r.waitForFunction(previous => window.__rxBytes > previous + 65536, pausedBytes, { timeout: 3000 });
   await a.r.getByRole('button', { name: '⏸ Pause', exact: true }).click();

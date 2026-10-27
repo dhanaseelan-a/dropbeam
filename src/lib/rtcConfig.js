@@ -1,3 +1,5 @@
+import { connectionSnapshot } from './connectionDiagnostics.js';
+
 const PUBLIC_ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' },
   { urls: 'stun:stun.l.google.com:19302' },
@@ -50,21 +52,7 @@ export async function getRTCConfig({ relayOnly = false, fetcher = globalThis.fet
 export async function detectNetwork(conn) {
   try {
     const pc = conn.peerConnection || conn._pc;
-    if (!pc) return { mode: 'internet' };
-    const stats = await pc.getStats();
-    let pair;
-    stats.forEach(stat => {
-      if (stat.type === 'transport' && stat.selectedCandidatePairId) pair = stats.get(stat.selectedCandidatePairId);
-    });
-    if (!pair) stats.forEach(stat => {
-      if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && (stat.nominated || stat.selected)) pair = stat;
-    });
-    const local = stats.get(pair?.localCandidateId)?.candidateType;
-    const remote = stats.get(pair?.remoteCandidateId)?.candidateType;
-    if (local === 'relay' || remote === 'relay') return { mode: 'relay' };
-    if (local === 'host' && remote === 'host') return { mode: 'lan' };
-    // A host candidate on just one end also occurs on Internet paths. It does
-    // not prove the devices share Wi-Fi.
+    if (pc) return { mode: connectionSnapshot(await pc.getStats()).mode };
   } catch { /* Network labels are best-effort and never block a transfer. */ }
-  return { mode: 'internet' };
+  return { mode: 'unknown' };
 }
