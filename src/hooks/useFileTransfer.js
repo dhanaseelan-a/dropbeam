@@ -1,9 +1,9 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import Peer from 'peerjs';
 
-import { CHUNK_SIZE, createFilePump, ReceiveSession, resumePosition } from '../lib/transferProtocol';
+import { CHUNK_SIZE, createFilePump, createReceiveQueue, ReceiveSession, resumePosition } from '../lib/transferProtocol';
 import { getRTCConfig, detectNetwork } from '../lib/rtcConfig';
-import { sendControlMessage as dcSendJSON } from '../lib/controlMessages';
+import { applyPauseState, createControlChannel, waitForControlChannel, sendControlMessage as dcSendJSON } from '../lib/controlMessages';
 
 const NETWORK_MODES = {
   lan:      { label: 'LAN / Hotspot', icon: '🔌', color: '#22c55e', detail: 'Same network' },
@@ -93,6 +93,7 @@ function playDone() {
 }
 
 function getDC(conn) { return conn?.dataChannel || conn?._dc; }
+function senderControl(receiver) { return receiver.control?.readyState === 'open' ? receiver.control : getDC(receiver.conn); }
 
 // ====== SENDER ======
 export function useFileSender() {
@@ -111,6 +112,7 @@ export function useFileSender() {
   const expiryRef = useRef(null);
   const signalRetryRef = useRef(null);
   const pausedRef = useRef(false);
+  const pauseVersionRef = useRef(0);
   const receiversRef = useRef([]);
   const pendingRef = useRef(new Set());
   const recoveryTimersRef = useRef(new Map());
@@ -129,7 +131,7 @@ export function useFileSender() {
     expiryRef.current = null;
     for (const receiver of receiversRef.current) {
       receiver.pump?.cancel();
-      dcSendJSON(getDC(receiver.conn), { type: 'cancel' });
+      dcSendJSON(senderControl(receiver), { type: 'cancel' });
     }
     // Invalidate callbacks before destroying the peer (which emits close).
     const peer = peerRef.current;
@@ -171,9 +173,10 @@ export function useFileSender() {
 
   const togglePause = useCallback(() => {
     pausedRef.current = !pausedRef.current;
+    pauseVersionRef.current++;
     setPaused(pausedRef.current);
     for (const receiver of receiversRef.current) {
-      dcSendJSON(getDC(receiver.conn), { type: pausedRef.current ? 'pause' : 'resume' });
+      dcSendJSON(senderControl(receiver), { type: pausedRef.current ? 'pause' : 'resume', pauseVersion: pauseVersionRef.current });
       if (!pausedRef.current) receiver.pump?.wake();
     }
   }, []);
@@ -184,6 +187,7 @@ export function useFileSender() {
     const active = () => generation === generationRef.current;
     const transferId = crypto.randomUUID();
     pausedRef.current = false;
+    pauseVersionRef.current = 0;
     setReceivers([]); setCodeExpiry(null); setPaused(false); setError('');
     setStatus('waiting');
     setCode('');
@@ -208,6 +212,7 @@ export function useFileSender() {
       if (!active()) { conn.close(); return; }
       let receiverId = `r_${crypto.randomUUID()}`;
       let pump;
+      let control;
       let handshakeTimer;
       let disconnectedTimer;
       let removeHandshake = () => {};
@@ -216,6 +221,8 @@ export function useFileSender() {
         clearTimeout(disconnectedTimer);
         removeHandshake();
         pump?.cancel();
+        control?.close();
+        control = null;
         pendingRef.current.delete(dispose);
       };
       pendingRef.current.add(dispose);
@@ -226,7 +233,7 @@ export function useFileSender() {
         const dc = getDC(conn);
         if (!dc) { dispose(); conn.close(); return; }
         dc.binaryType = 'arraybuffer';
-        const handshake = event => {
+        const handshake = async event => {
           if (typeof event.data !== 'string') return;
           let message;
           try { message = JSON.parse(event.data); } catch { return; }
@@ -264,10 +271,24 @@ export function useFileSender() {
           const currentFiles = filesRef.current;
           const resume = resumePosition(currentFiles, message, transferId);
           const pc = conn.peerConnection || conn._pc;
+          if (Number.isInteger(message.controlChannelId)) {
+            const candidate = createControlChannel(conn, dc, message.controlChannelId);
+            control = candidate;
+            if (candidate && !await waitForControlChannel(candidate)) {
+              candidate.close();
+              if (control === candidate) control = null;
+            }
+            if (!active() || dc.readyState !== 'open') { dispose(); return; }
+            if (control) dcSendJSON(dc, { type: 'control-ready', id: control.id });
+          }
+          // updateReceiver replaces render snapshots, so retain live handles in
+          // the current row as well as this connection's callbacks.
+          receiver.control = control;
           pump = createFilePump({
-            channel: dc, files: currentFiles, transferId, device: getDeviceName(), resume,
+            channel: dc, controlChannel: control || dc, files: currentFiles, transferId, device: getDeviceName(), resume,
+            initialPaused: !!message.paused, initialPauseVersion: message.pauseVersion ?? -1,
             maxMessageSize: pc?.sctp?.maxMessageSize,
-            isPaused: () => pausedRef.current || receiver.remotePaused,
+            isPaused: () => pausedRef.current,
             onProgress: stats => {
               if (!active()) return;
               updateReceiver(receiverId, {
@@ -282,7 +303,7 @@ export function useFileSender() {
             onControl: msg => {
               if (!active()) return;
               if (msg.type === 'pause' || msg.type === 'resume' || (msg.type === 'ack' && typeof msg.paused === 'boolean')) {
-                const nextPaused = msg.type === 'ack' ? msg.paused : msg.type === 'pause';
+                const nextPaused = msg.paused;
                 if (receiver.remotePaused !== nextPaused) {
                   receiver.remotePaused = nextPaused;
                   updateReceiver(receiverId, { remotePaused: nextPaused });
@@ -307,7 +328,7 @@ export function useFileSender() {
             onError: err => {
               if (!active()) return;
               updateReceiver(receiverId, { status: 'error', error: err.message });
-              dcSendJSON(dc, { type: 'rejected', reason: err.message });
+              dcSendJSON(control || dc, { type: 'rejected', reason: err.message });
               dispose();
             },
             onDisconnect: () => {
@@ -317,7 +338,8 @@ export function useFileSender() {
             },
           });
           receiver.pump = pump;
-          dcSendJSON(dc, { type: pausedRef.current ? 'pause' : 'resume' });
+          updateReceiver(receiverId, { pump, control });
+          dcSendJSON(control || dc, { type: pausedRef.current ? 'pause' : 'resume', pauseVersion: pauseVersionRef.current });
           detectNetwork(conn).then(net => {
             if (active() && getDC(conn)?.readyState === 'open') updateReceiver(receiverId, { networkMode: net.mode });
           });
@@ -385,9 +407,13 @@ export function useFileReceiver() {
   const peerRef = useRef(null);
   const connRef = useRef(null);
   const dcRef = useRef(null);
+  const controlRef = useRef(null);
   const generationRef = useRef(0);
   const statusRef = useRef('idle');
   const pausedRef = useRef(false);
+  const pauseVersionRef = useRef(0);
+  const senderPauseRef = useRef({ paused: false, version: -1 });
+  const pauseChangedRef = useRef(() => {});
   const sessionRef = useRef(new ReceiveSession());
   const disposeRef = useRef(() => {});
 
@@ -399,12 +425,13 @@ export function useFileReceiver() {
     disposeRef.current();
     disposeRef.current = () => {};
     const peer = peerRef.current;
-    peerRef.current = null; connRef.current = null; dcRef.current = null;
+    peerRef.current = null; connRef.current = null; dcRef.current = null; controlRef.current = null;
+    pauseChangedRef.current = () => {};
     peer?.destroy();
   }, []);
 
   const cleanup = useCallback(() => {
-    dcSendJSON(dcRef.current, { type: 'cancel' });
+    dcSendJSON(controlRef.current || dcRef.current, { type: 'cancel' });
     stopConnection();
     sessionRef.current.reset();
     pausedRef.current = false;
@@ -417,8 +444,10 @@ export function useFileReceiver() {
 
   const togglePause = useCallback(() => {
     pausedRef.current = !pausedRef.current;
+    pauseVersionRef.current++;
     setPaused(pausedRef.current);
-    dcSendJSON(dcRef.current, { type: pausedRef.current ? 'pause' : 'resume' });
+    dcSendJSON(controlRef.current || dcRef.current, { type: pausedRef.current ? 'pause' : 'resume', pauseVersion: pauseVersionRef.current });
+    pauseChangedRef.current();
   }, []);
 
   const connect = useCallback(code => {
@@ -429,6 +458,8 @@ export function useFileReceiver() {
     const session = sessionRef.current;
     session.reset();
     pausedRef.current = false;
+    pauseVersionRef.current = 0;
+    senderPauseRef.current = { paused: false, version: -1 };
     setStatus('connecting'); setError(''); setNetworkMode(null);
     setPaused(false); setRemotePaused(false); setMetrics(emptyMetrics());
     setTransferStats(null); setFileList([]); setCurrentFileIndex(0); setCurrentFileName('');
@@ -437,6 +468,7 @@ export function useFileReceiver() {
     let samples = [], lastAck = 0, lastUI = 0;
     let lastSpeed = 0, lastEta = '', lastEtc = '';
     let removeMessage = () => {};
+    let receiveQueue;
     let relayOnly = false;
     let attemptGeneration = 0;
 
@@ -445,15 +477,17 @@ export function useFileReceiver() {
       clearTimeout(connectionTimer); clearTimeout(disconnectTimer); clearInterval(ackTimer);
       clearTimeout(ackDelayTimer); ackDelayTimer = null;
       removeMessage(); removeMessage = () => {};
+      receiveQueue?.clear(); receiveQueue = null;
+      pauseChangedRef.current = () => {};
       const peer = peerRef.current;
-      peerRef.current = null; connRef.current = null; dcRef.current = null;
+      peerRef.current = null; connRef.current = null; dcRef.current = null; controlRef.current = null;
       peer?.destroy();
     };
     disposeRef.current = () => { clearTimeout(retryTimer); disposeAttempt(); };
 
     const fail = message => {
       if (!active()) return;
-      dcSendJSON(dcRef.current, { type: 'cancel' });
+      dcSendJSON(controlRef.current || dcRef.current, { type: 'cancel' });
       stopConnection();
       session.reset();
       setRemotePaused(false); setPaused(false); pausedRef.current = false;
@@ -461,7 +495,7 @@ export function useFileReceiver() {
     };
 
     const sendAck = (force = false, refreshUI = force) => {
-      const dc = dcRef.current;
+      const dc = controlRef.current || dcRef.current;
       if (!dc || dc.readyState !== 'open') return;
       const now = Date.now();
       if (!force && now - lastAck < 20) {
@@ -478,7 +512,10 @@ export function useFileReceiver() {
       samples.push({ time: now, bytes: session.received });
       while (samples.length > 2 && now - samples[0].time > 3000) samples.shift();
       const first = samples[0];
-      lastSpeed = now > first.time ? Math.max(0, (session.received - first.bytes) * 1000 / (now - first.time)) : 0;
+      const isPaused = pausedRef.current || senderPauseRef.current.paused;
+      // A millisecond-sized first sample exaggerates burst speed. Speed is
+      // display telemetry, independent of transport flow control.
+      lastSpeed = !isPaused && now - first.time >= 250 ? Math.max(0, (session.received - first.bytes) * 1000 / (now - first.time)) : 0;
       const remaining = lastSpeed > 0 ? (session.total - session.received) / lastSpeed : 0;
       const updateUI = refreshUI || now - lastUI >= 200;
       if (updateUI) {
@@ -487,7 +524,7 @@ export function useFileReceiver() {
       }
       const progress = session.complete ? 100 : session.total ? Math.min(99, Math.round(session.received / session.total * 100)) : 0;
       dcSendJSON(dc, { type: 'ack', received: session.received, progress, speed: lastSpeed, eta: lastEta, etc: lastEtc,
-        paused: pausedRef.current });
+        paused: pausedRef.current, pauseVersion: pauseVersionRef.current });
       if (updateUI) {
         lastUI = now;
         setMetrics({ progress, speed: lastSpeed, eta: lastEta, etc: lastEtc,
@@ -546,7 +583,7 @@ export function useFileReceiver() {
           sendAck(true);
           // Completion means every file-end was processed and every byte was
           // verified, not just that the sender's native buffer became empty.
-          dcSendJSON(dcRef.current, { type: 'complete', received: session.received });
+          dcSendJSON(controlRef.current || dcRef.current, { type: 'complete', received: session.received });
           clearInterval(ackTimer); clearTimeout(connectionTimer); clearTimeout(disconnectTimer);
           clearTimeout(ackDelayTimer); ackDelayTimer = null;
           const totalTime = Math.max(0.001, (Date.now() - startedAt) / 1000);
@@ -561,8 +598,11 @@ export function useFileReceiver() {
         case 'tier-update': case 'config-update': case 'chunk-update':
           if (message.chunkSize) setActiveChunkSize(message.chunkSize);
           break;
-        case 'pause': setRemotePaused(true); break;
-        case 'resume': setRemotePaused(false); break;
+        case 'pause': case 'resume':
+          applyPauseState(senderPauseRef.current, message);
+          setRemotePaused(senderPauseRef.current.paused);
+          pauseChangedRef.current();
+          break;
         case 'cancel': fail('Transfer cancelled by sender'); break;
         case 'rejected': fail(message.reason || 'Transfer rejected'); break;
         default: break;
@@ -590,30 +630,75 @@ export function useFileReceiver() {
           if (!dc) { scheduleReconnect(); return; }
           dcRef.current = dc; dc.binaryType = 'arraybuffer';
           setStatus('connected');
+          const consume = data => {
+            if (!isCurrent() || session.complete) return;
+            if (typeof data === 'string') handleControl(JSON.parse(data));
+            else if (data instanceof ArrayBuffer) {
+              session.append(data);
+              chunks++;
+              attempts = 0; reconnectSince = 0;
+              if (data.byteLength !== observedChunkSize && session.offset < session.currentFile.size) {
+                observedChunkSize = data.byteLength;
+                setActiveChunkSize(observedChunkSize);
+              }
+              sendAck(chunks === 1);
+            }
+          };
+          receiveQueue = createReceiveQueue({
+            isPaused: () => pausedRef.current || senderPauseRef.current.paused,
+            consume,
+          });
+          pauseChangedRef.current = () => {
+            samples = [{ time: Date.now(), bytes: session.received }];
+            try {
+              receiveQueue?.drain();
+              sendAck(true);
+            } catch (err) { fail(err.message || 'Invalid transfer data'); }
+          };
+          const control = createControlChannel(conn, dc, dc.id === 2 ? 4 : 2);
+          let controlAccepted = false;
+          const selectControl = () => {
+            if (isCurrent() && controlAccepted && control?.readyState === 'open') controlRef.current = control;
+          };
           const onMessage = event => {
             if (!isCurrent() || session.complete) return;
             try {
-              if (typeof event.data === 'string') handleControl(JSON.parse(event.data));
-              else if (event.data instanceof ArrayBuffer) {
-                // Protocol state changes synchronously, unlike React state; the
-                // first chunk cannot be lost while React renders file-list.
-                session.append(event.data);
-                chunks++;
-                attempts = 0; reconnectSince = 0;
-                if (event.data.byteLength !== observedChunkSize && session.offset < session.currentFile.size) {
-                  observedChunkSize = event.data.byteLength;
-                  setActiveChunkSize(observedChunkSize);
+              if (typeof event.data === 'string') {
+                const message = JSON.parse(event.data);
+                if (message.type === 'control-ready') {
+                  controlAccepted = control?.id === message.id;
+                  selectControl();
+                  return;
                 }
-                sendAck(chunks === 1);
+                if (['file-list', 'pause', 'resume', 'cancel', 'rejected'].includes(message.type)) {
+                  handleControl(message); return;
+                }
               }
-            } catch (err) { fail(err.message || 'Invalid transfer data'); }
+              receiveQueue.push(event.data);
+            } catch (err) {
+              if (err.name === 'QuotaExceededError') scheduleReconnect();
+              else fail(err.message || 'Invalid transfer data');
+            }
           };
           dc.addEventListener('message', onMessage);
-          removeMessage = () => dc.removeEventListener('message', onMessage);
+          control?.addEventListener('message', onMessage);
+          control?.addEventListener('open', selectControl);
+          const controlClosed = () => { if (isCurrent() && controlRef.current === control) scheduleReconnect(); };
+          control?.addEventListener('close', controlClosed);
+          control?.addEventListener('error', controlClosed);
+          removeMessage = () => {
+            dc.removeEventListener('message', onMessage);
+            control?.removeEventListener('message', onMessage);
+            control?.removeEventListener('open', selectControl);
+            control?.removeEventListener('close', controlClosed);
+            control?.removeEventListener('error', controlClosed);
+            control?.close();
+          };
           // Install the receive listener before the sender may respond.
           dcSendJSON(dc, { type: 'device-info', protocol: 2, receiverId, device: getDeviceName(),
             transferId: session.transferId, resumeIndex: session.index, resumeOffset: session.offset,
-            paused: pausedRef.current });
+            paused: pausedRef.current, pauseVersion: pauseVersionRef.current,
+            controlChannelId: control?.id });
           detectNetwork(conn).then(net => { if (isCurrent()) setNetworkMode(net.mode); });
         });
         conn.on('iceStateChanged', state => {

@@ -1,16 +1,38 @@
 // Transport code is independent of React so byte ordering, retries and resume
 // can be tested without a signalling service or a particular mobile carrier.
-import { flushControlMessages } from './controlMessages.js';
+import { applyPauseState, flushControlMessages } from './controlMessages.js';
 
 // Start with small SCTP messages to avoid monopolising slower associations
-// (RFC 8831, section 6.6); retain bounded adaptation for fast, low-latency paths.
+// (RFC 8831, section 6.6); retain bounded adaptation for fast paths.
 export const CHUNK_SIZE = 16 * 1024;
 export const MAX_CHUNK = 64 * 1024;
-const MIN_BUFFER = 64 * 1024;
-const MAX_BUFFER = 2 * 1024 * 1024;
-const MIN_IN_FLIGHT = 128 * 1024;
+const SEND_BUFFER = 256 * 1024;
 const READ_SIZE = 4 * 1024 * 1024;
-const MAX_IN_FLIGHT = 16 * 1024 * 1024;
+export const MAX_IN_FLIGHT = 8 * 1024 * 1024;
+
+// A pause cannot recall bytes already accepted by SCTP. Hold those frames,
+// including file-end/all-done, until Resume so neither progress nor downloads
+// complete behind the pause banner. Allow the previous client's 16 MB window.
+export function createReceiveQueue({ isPaused, consume, maxBytes = 17 * 1024 * 1024 }) {
+  let pending = [], bytes = 0;
+  return {
+    push(data) {
+      if (!isPaused() && !pending.length) { consume(data); return; }
+      const size = typeof data === 'string' ? data.length * 2 : data.byteLength;
+      if (bytes + size > maxBytes) throw new DOMException('Paused receive queue is full', 'QuotaExceededError');
+      pending.push(data);
+      bytes += size;
+    },
+    drain() {
+      while (pending.length && !isPaused()) {
+        const batch = pending;
+        pending = []; bytes = 0;
+        for (const data of batch) this.push(data);
+      }
+    },
+    clear() { pending = []; bytes = 0; },
+  };
+}
 
 export function negotiatedChunkSize(maxMessageSize) {
   // Zero means unlimited; an absent SCTP limit requires a conservative default.
@@ -112,7 +134,8 @@ export class ReceiveSession {
 }
 
 export function createFilePump({
-  channel, files, transferId, device, resume = { index: 0, offset: 0, received: 0 },
+  channel, controlChannel = channel, files, transferId, device, resume = { index: 0, offset: 0, received: 0 },
+  initialPaused = false, initialPauseVersion = -1,
   maxMessageSize, isPaused = () => false, onProgress = () => {},
   onControl = () => {}, onDone = () => {}, onError = () => {},
   onDisconnect = () => {}, stallTimeout = 60000,
@@ -122,14 +145,13 @@ export function createFilePump({
   let sent = resume.received, received = resume.received;
   let chunkLimit = negotiatedChunkSize(maxMessageSize);
   let chunkSize = Math.min(CHUNK_SIZE, chunkLimit);
-  let chunksSent = 0, speed = 0, eta = '', etc = '', remotePaused = false;
+  let chunksSent = 0, speed = 0, eta = '', etc = '';
+  const remotePause = { paused: initialPaused, version: initialPauseVersion };
   let batch = null, batchPosition = 0, fileStarted = false, manifestSent = false;
   let pumping = false, stopped = false, finishing = false, queued = false;
   let retryTimer = null, lastProgress = Date.now(), lastUI = 0;
-  let bufferHigh = MIN_BUFFER, flightLimit = MIN_IN_FLIGHT, roundTrip = 100;
-  const flights = [];
   const startedAt = Date.now();
-  channel.bufferedAmountLowThreshold = bufferHigh / 2;
+  channel.bufferedAmountLowThreshold = SEND_BUFFER / 4;
 
   function dispose() {
     stopped = true;
@@ -139,6 +161,11 @@ export function createFilePump({
     channel.removeEventListener('message', handleMessage);
     channel.removeEventListener('close', handleClose);
     channel.removeEventListener('error', handleClose);
+    if (controlChannel !== channel) {
+      controlChannel.removeEventListener('message', handleMessage);
+      controlChannel.removeEventListener('close', handleClose);
+      controlChannel.removeEventListener('error', handleClose);
+    }
     batch = null;
   }
 
@@ -170,7 +197,7 @@ export function createFilePump({
     }, 25);
   }
 
-  // Every control frame uses the same ordered channel as the file bytes.
+  // File metadata and boundaries use the same ordered channel as file bytes.
   // A full native send queue must retry the frame, not drop file-end/all-done.
   function send(data) {
     try { channel.send(data); return true; }
@@ -188,27 +215,18 @@ export function createFilePump({
       if (Number.isFinite(message.received) && message.received >= received && message.received <= sent) {
         if (message.received > received) {
           lastProgress = Date.now();
-          let latest;
-          while (flights.length && flights[0].end <= message.received) latest = flights.shift();
-          if (latest) roundTrip = roundTrip * 0.75 + (Date.now() - latest.time) * 0.25;
         }
         received = message.received;
       }
       speed = Number.isFinite(message.speed) ? Math.max(0, message.speed) : speed;
       eta = message.eta || '';
       etc = message.etc || '';
-      // Grow with measured delivery rate and latency, rather than immediately
-      // queuing 4 MB on a slow phone. Fast paths keep enough bytes in flight;
-      // slow paths drain promptly when either user presses Pause.
-      if (speed > 0) {
-        bufferHigh = Math.max(MIN_BUFFER, Math.min(MAX_BUFFER, speed * 0.075));
-        flightLimit = Math.max(MIN_IN_FLIGHT, Math.min(MAX_IN_FLIGHT, speed * (roundTrip / 1000 * 1.5 + 0.15)));
-        channel.bufferedAmountLowThreshold = Math.floor(bufferHigh / 2);
-      }
-      chunkSize = Math.min(chunkLimit, speed > 10 * 1024 * 1024 && roundTrip < 50 ? MAX_CHUNK : CHUNK_SIZE);
-      if (typeof message.paused === 'boolean') {
-        remotePaused = message.paused;
-      }
+      // SCTP handles congestion. UI speed (including zero after a pause) must
+      // not cap the transport's delivery window or create an ACK round-trip
+      // bottleneck. Keep the native queue small and total unacknowledged bytes
+      // bounded independently; controls use their own stream.
+      chunkSize = Math.min(chunkLimit, speed > 10 * 1024 * 1024 ? MAX_CHUNK : CHUNK_SIZE);
+      applyPauseState(remotePause, message);
       report();
       // Resume immediately on acknowledgements, including in background tabs.
       wake();
@@ -218,15 +236,15 @@ export function createFilePump({
       onDone({ totalBytes: total, totalTime: Math.max(0.001, (Date.now() - startedAt) / 1000),
         transferredBytes: total - resume.received });
     } else if (message.type === 'pause') {
-      remotePaused = true;
+      applyPauseState(remotePause, message);
     } else if (message.type === 'resume') {
-      remotePaused = false;
+      applyPauseState(remotePause, message);
       lastProgress = Date.now();
       wake();
     } else if (message.type === 'cancel') {
       dispose();
     }
-    onControl(message);
+    onControl({ ...message, paused: remotePause.paused });
   }
 
   async function pump() {
@@ -235,14 +253,14 @@ export function createFilePump({
     try {
       while (!stopped && channel.readyState === 'open') {
         if (!flushControlMessages(channel)) { retry(); return; }
-        if (channel.bufferedAmount >= bufferHigh || sent - received >= flightLimit) return;
+        if (channel.bufferedAmount >= SEND_BUFFER || sent - received >= MAX_IN_FLIGHT) return;
         if (!manifestSent) {
           if (!send(JSON.stringify({ type: 'file-list', protocol: 2, transferId,
             files: files.map(f => ({ name: f.name, size: f.size, fileType: f.type })),
             device, chunkSize, resumeIndex: resume.index, resumeOffset: resume.offset }))) return;
           manifestSent = true;
         }
-        if (isPaused() || remotePaused) return;
+        if (isPaused() || remotePause.paused) return;
         if (index >= files.length) {
           if (!send(JSON.stringify({ type: 'all-done' }))) return;
           finishing = true;
@@ -272,7 +290,7 @@ export function createFilePump({
           if (stopped) return;
           continue;
         }
-        const length = Math.min(chunkSize, batch.byteLength - batchPosition);
+        const length = Math.min(chunkSize, batch.byteLength - batchPosition, MAX_IN_FLIGHT - (sent - received));
         const data = batch.subarray(batchPosition, batchPosition + length);
         try {
           if (!send(data)) return;
@@ -287,8 +305,6 @@ export function createFilePump({
         batchPosition += length;
         offset += length;
         sent += length;
-        // At most one RTT sample per 64 KB keeps bookkeeping bounded.
-        if (!flights.length || sent - flights.at(-1).end >= MIN_BUFFER) flights.push({ end: sent, time: Date.now() });
         chunksSent++;
         if (batchPosition === batch.byteLength) batch = null;
       }
@@ -304,7 +320,7 @@ export function createFilePump({
 
   const watchdog = setInterval(() => {
     if (channel.readyState !== 'open') { handleClose(); return; }
-    if (isPaused() || remotePaused) lastProgress = Date.now();
+    if (isPaused() || remotePause.paused) lastProgress = Date.now();
     else if (Date.now() - lastProgress > stallTimeout) {
       disconnect('Transfer stalled; reconnecting');
       return;
@@ -317,6 +333,11 @@ export function createFilePump({
   channel.addEventListener('message', handleMessage);
   channel.addEventListener('close', handleClose);
   channel.addEventListener('error', handleClose);
+  if (controlChannel !== channel) {
+    controlChannel.addEventListener('message', handleMessage);
+    controlChannel.addEventListener('close', handleClose);
+    controlChannel.addEventListener('error', handleClose);
+  }
   wake();
   return { wake, cancel: dispose };
 }
