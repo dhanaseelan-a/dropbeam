@@ -1,5 +1,6 @@
 {
   "rewrites": [
+    { "source": "/api/ice-servers", "destination": "/api/ice-servers" },
     { "source": "/sitemap.xml", "destination": "/sitemap.xml" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
