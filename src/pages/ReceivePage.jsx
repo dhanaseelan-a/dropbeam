@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react';
 import { useFileReceiver, formatBytes, formatTime, NETWORK_MODES, getSpeedLabel, CHUNK_SIZE } from '../hooks/useFileTransfer';
 import { getFileIcon } from '../components/FilePreview';
+import ConnectionDetails from '../components/ConnectionDetails';
 
 function ReceivePage({ onTransferStateChange }) {
   const {
     status, progress, speed, speedRaw, eta, etc, error, networkWarning,
     fileList, currentFileIndex, currentFileName,
     transferStats, peerDevice, activeChunkSize,
-    networkMode, speedLabel, remotePaused, paused, togglePause,
+    networkMode, connectionInfo, remoteHidden, remoteWasHidden, speedLabel, remotePaused, paused, togglePause,
     bytesReceived, bytesTotal, chunksReceived,
     connect, cleanup
   } = useFileReceiver();
@@ -106,6 +107,9 @@ function ReceivePage({ onTransferStateChange }) {
                   {networkMode && <div className="network-chip" style={{ '--net-color': NETWORK_MODES[networkMode].color }}>{NETWORK_MODES[networkMode].icon} {NETWORK_MODES[networkMode].label}</div>}
                 </div>
               )}
+
+              <ConnectionDetails info={connectionInfo} speed={speedRaw} side="receiver"
+                remoteHidden={remoteHidden} remoteWasHidden={remoteWasHidden} />
 
               {/* Pause banners */}
               {remotePaused && (

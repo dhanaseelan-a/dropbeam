@@ -4,6 +4,7 @@ import JSZip from 'jszip';
 import { QRCodeSVG } from 'qrcode.react';
 import { useFileSender, formatBytes, formatTime, NETWORK_MODES, getSpeedLabel } from '../hooks/useFileTransfer';
 import { FilePreview, FileThumbnail, getFileIcon } from '../components/FilePreview';
+import ConnectionDetails from '../components/ConnectionDetails';
 
 function SendPage({ onTransferStateChange }) {
   const {
@@ -273,7 +274,7 @@ function SendPage({ onTransferStateChange }) {
                   <div className="receiver-card" key={r.id}>
                     <div className="receiver-header">
                       <span className="receiver-device">{r.device || 'Unknown device'}</span>
-                      {net && <span className="network-chip-sm" style={{ '--net-color': net.color }}>{net.icon}</span>}
+                      {net && <span className="network-chip-sm" style={{ '--net-color': net.color }}>{net.icon} {net.label}</span>}
                       {r.status === 'done' && <span className="file-done-badge">✓</span>}
                       {r.status === 'cancelled' && <span className="file-cancel-badge">✕</span>}
                     </div>
@@ -284,6 +285,8 @@ function SendPage({ onTransferStateChange }) {
 
                     {r.status === 'transferring' && (
                       <>
+                        <ConnectionDetails info={r.connectionInfo} flow={r.flowInfo} speed={displaySpeed}
+                          side="sender" remoteHidden={r.remoteHidden} remoteWasHidden={r.remoteWasHidden} />
                         {/* Remote pause banner */}
                         {r.remotePaused && (
                           <div className="remote-pause-banner fade-in">⏸ Receiver paused transfer</div>

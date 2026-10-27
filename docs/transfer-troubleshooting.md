@@ -74,6 +74,38 @@ deadline so an unavailable endpoint cannot leave connection setup hanging.
 
 ## Validation
 
+### Diagnose low speed on a real device
+
+During a transfer, open **Connection details** on both devices. The selected
+route, RTT and network byte rates refresh once a second; missing stats show
+"Checking connection" rather than an assumed Internet route. **Copy diagnostics**
+captures the current sample, including send-buffer and unacknowledged-byte
+counts on the sender. Copy after at least 20 seconds of an active transfer.
+Reports omit filenames, peer IDs, IP addresses and credentials; they stay on
+the device until the user copies and shares them.
+
+- **Direct connection / Direct (host to host)** means no TURN relay is in the
+  selected path. Host candidates alone do not prove both devices use the same
+  Wi-Fi: they can also have globally routable addresses.
+- **Relay** means internet relaying is involved, even if a phone and laptop
+  share a hotspot. The transport row distinguishes the selected candidate's
+  UDP/TCP protocol from the local browser-to-relay transport (UDP/TCP/TLS).
+  The receiver's report is also needed when only that side uses a relay.
+- The app displays bytes per second. Convert to bits per second when comparing
+  an ISP speed test: 200 KB/s is about 1.6 Mbps. A peer transfer may be limited
+  by upload capacity even when the sender's download speed is much higher.
+- Chrome-to-Edge on one phone is not an isolated network benchmark: switching
+  apps backgrounds one endpoint. The app reports current and previous hidden
+  page state. Background status is evidence to investigate, not proof that the
+  operating system throttled the transfer. Test phone-to-laptop with both pages
+  visible and screens awake to separate this variable.
+
+These details do not change ICE routing, relay credentials, congestion control
+or pause/resume. An endpoint HTTP 200 or passing simulated tests does not prove
+that a physical hotspot uses a direct route or establish its achievable speed.
+
+### Automated checks
+
 Run `npm ci`, `npm test` and `npm run build`. The Node tests exercise the real
 transport functions with deterministic channel faults and verify output bytes.
 

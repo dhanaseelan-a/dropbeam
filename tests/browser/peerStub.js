@@ -91,7 +91,7 @@ class Conn extends Events {
     this.peerConnection = {
       sctp: { maxMessageSize: 262144 },
       close: () => this.close(),
-      getStats: async () => new Map(),
+      getStats: async () => new Map(window.__rtcStats || []),
       createDataChannel: (label, options) => {
         if (window.__legacyChannels) throw new Error('No auxiliary channel');
         const channel = new DataChannel(this, options.id);
